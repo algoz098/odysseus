@@ -9,9 +9,23 @@ import json
 import logging
 import os
 import re
-import asyncio 
-from typing import Any, Dict, List, Optional, Set, Tuple
+import asyncio
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from src.database import McpServer, SessionLocal
+
+# Module-level singleton so extensions and tests share state with the
+# running app's McpManager. ``app.py`` also instantiates one of these —
+# that's fine; both end up pointing at the same singleton.
+_singleton: Optional["McpManager"] = None
+
+
+def get_mcp_manager() -> "McpManager":
+    """Return the process-wide McpManager singleton."""
+    global _singleton
+    if _singleton is None:
+        _singleton = McpManager()
+    return _singleton
 
 from src.runtime_paths import get_app_root
 
@@ -162,12 +176,21 @@ class McpManager:
         # entered it. AnyIO cancel scopes must be exited by that same task.
         self._owner_shutdown_events: Dict[str, asyncio.Event] = {}
         self._owner_tasks: Dict[str, asyncio.Task] = {}
+        # server_id -> tool_name -> handler (added by OXS in-process tools)
+        self._in_process_tools: Dict[str, Dict[str, Callable]] = {}
         # Tracking updates to tools/connections for RAG indexing / prompt cache
         self._generation = 0
         # Identity of the actual connection, not a PID or lifecycle contract.
         self._resource_connections = {}
         self._resource_endpoints = {}
         self._resource_owners = {}
+
+        # Auto-register as the singleton if none exists yet. Lets `McpManager()`
+        # stay a valid constructor while still ensuring extensions share
+        # one manager with the running app.
+        global _singleton
+        if _singleton is None:
+            _singleton = self
 
     async def connect_server(
         self,
@@ -490,6 +513,77 @@ class McpManager:
         for sid in ids:
             await self.disconnect_server(sid)
 
+    # ── In-process tools (OXS extensions) ─────────────────────────────────
+    #
+    # Plugins register tools that live in the host Python process. They do
+    # not spawn a subprocess and do not need a session. Dispatch goes
+    # through ``call_tool`` which checks ``_in_process_tools`` before the
+    # session lookup.
+
+    def register_in_process_tool(
+        self,
+        server_id: str,
+        tool_name: str,
+        *,
+        input_schema: Dict,
+        description: str,
+        handler: Callable,
+    ) -> None:
+        """Register one tool under a namespaced server.
+
+        ``handler`` is ``async def handler(arguments: dict) -> Any`` (or sync).
+        ``input_schema`` is the JSON Schema the LLM sees. ``description``
+        is what shows up next to the tool name in the function-calling UI.
+        """
+        if server_id not in self._in_process_tools:
+            self._in_process_tools[server_id] = {}
+        # Make sure the connection entry exists so the OpenAI schema
+        # formatter can read a server name.
+        if server_id not in self._connections:
+            self._connections[server_id] = {
+                "name": server_id,
+                "transport": "in-process",
+                "identity": "",
+            }
+        else:
+            self._connections[server_id]["transport"] = "in-process"
+        self._in_process_tools[server_id][tool_name] = {
+            "input_schema": input_schema,
+            "description": description,
+            "handler": handler,
+        }
+        self._generation += 1
+
+    def unregister_in_process_tools(self, server_id: str) -> int:
+        """Remove every tool belonging to ``server_id``. Returns count."""
+        removed = len(self._in_process_tools.get(server_id, {}))
+        self._in_process_tools.pop(server_id, None)
+        # Clean up the connection entry we added. We leave _connections
+        # alone if it pre-existed and was modified by us — operators may
+        # have other tools there. For the in-process-only case, the entry
+        # is ours alone.
+        if self._connections.get(server_id, {}).get("transport") == "in-process":
+            # Only remove if the connection has no other indicators.
+            conn = self._connections[server_id]
+            if set(conn.keys()) <= {"name", "transport", "identity"}:
+                self._connections.pop(server_id, None)
+        self._generation += 1
+        return removed
+
+    def _format_in_process_result(self, qualified_name: str, result: Any) -> Dict:
+        """Wrap an in-process handler's result into the agent tool schema."""
+        if isinstance(result, dict):
+            if "exit_code" in result:
+                return result
+            if "error" in result:
+                return {"error": result["error"], "exit_code": 1}
+            return {"output": result, "exit_code": 0}
+        if result is None:
+            return {"output": "", "exit_code": 0}
+        if isinstance(result, str):
+            return {"output": result, "exit_code": 0}
+        return {"output": str(result), "exit_code": 0}
+
 
     async def connect_all_enabled(self):
         db = SessionLocal()
@@ -569,6 +663,24 @@ class McpManager:
 
         server_id = parts[1]
         tool_name = parts[2]
+
+        # In-process tools (added via OXS extensions) take priority and
+        # bypass the subprocess session entirely.
+        in_proc = self._in_process_tools.get(server_id, {})
+        if tool_name in in_proc:
+            entry = in_proc[tool_name]
+            handler = entry.get("handler") if isinstance(entry, dict) else entry
+            try:
+                if inspect.iscoroutinefunction(handler):
+                    result = await handler(arguments or {})
+                else:
+                    result = handler(arguments or {})
+            except Exception as e:
+                logger.error(
+                    "OXS in-process tool %s failed: %s", qualified_name, e,
+                )
+                return {"error": str(e), "exit_code": 1}
+            return self._format_in_process_result(qualified_name, result)
 
         session = self._sessions.get(server_id)
         if not session:
@@ -721,6 +833,24 @@ class McpManager:
                     },
                 }
                 schemas.append(schema)
+
+        # In-process tools (registered via OXS extensions) are appended.
+        for server_id, in_proc in self._in_process_tools.items():
+            disabled = (disabled_map or {}).get(server_id, set())
+            conn = self._connections.get(server_id, {})
+            server_name = conn.get("name", server_id)
+            for tool_name, tool in in_proc.items():
+                if tool_name in disabled:
+                    continue
+                qualified = f"mcp__{server_id}__{tool_name}"
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": qualified,
+                        "description": f"[MCP:{server_name}] {tool.get('description', '')}",
+                        "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                    },
+                })
 
         return schemas
 

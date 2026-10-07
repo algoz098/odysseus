@@ -2191,6 +2191,63 @@ class Integration(TimestampMixin, Base):
     enabled = Column(Boolean, default=True)
 
 
+class Extension(TimestampMixin, Base):
+    """An installed OXS extension.
+
+    One row per extension id. Created on install, mutated on enable/disable,
+    removed on uninstall. The append-only audit log (``OXS_AUDIT_LOG``) keeps
+    the full history; this table holds current state.
+    """
+    __tablename__ = "extensions"
+
+    id            = Column(String, primary_key=True, index=True)
+    name          = Column(String, nullable=False)
+    version       = Column(String, nullable=False)
+    oxs_version   = Column(String, nullable=False)
+    source        = Column(String, nullable=False)
+    source_path   = Column(String, nullable=False)
+    entry_point   = Column(String, nullable=False)
+    manifest_json = Column(Text, nullable=False)
+    file_hashes   = Column(JSON, nullable=True)
+    is_enabled    = Column(Boolean, default=False, index=True)
+    is_bundled    = Column(Boolean, default=False)
+    installed_by  = Column(String, nullable=True)
+    install_error = Column(Text, nullable=True)
+    last_enabled_at = Column(DateTime, nullable=True)
+
+
+class ExtensionPermission(TimestampMixin, Base):
+    """Operator-granted permissions for one extension.
+
+    Safe capabilities are auto-granted on enable. Privileged capabilities are
+    recorded only after explicit operator confirmation during install.
+    """
+    __tablename__ = "extension_permissions"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    extension_id = Column(String, nullable=False, index=True)
+    capability   = Column(String, nullable=False)
+    scope        = Column(JSON, nullable=True)
+    granted_by   = Column(String, nullable=True)
+    granted_at   = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
+class ExtensionAudit(Base):
+    """State-changing audit events for one extension.
+
+    Mirror of ``OXS_AUDIT_LOG`` for queryable access via the admin UI. The
+    append-only log file is the canonical source; this table is a denormalized
+    view that supports filtering and pagination without reading the file.
+    """
+    __tablename__ = "extension_audits"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    extension_id = Column(String, nullable=True, index=True)
+    event        = Column(String, nullable=False, index=True)
+    actor        = Column(String, nullable=True)
+    payload      = Column(JSON, nullable=True)
+    created_at   = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
+
 
 
 

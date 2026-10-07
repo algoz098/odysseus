@@ -289,6 +289,9 @@ if AUTH_ENABLED:
     import re as _re
     AUTH_EXEMPT_PATTERNS = [
         _re.compile(r"^/api/tasks/[^/]+/webhook/[^/]+/?$"),
+        # OXS extension inbound webhooks — token in path is the credential,
+        # token check happens inside the route handler.
+        _re.compile(r"^/api/ext/[^/]+/webhook/[^/]+/?$"),
     ]
 
     def _is_auth_exempt(path: str) -> bool:
@@ -855,6 +858,17 @@ app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_m
 # API Tokens
 from routes.api_token_routes import setup_api_token_routes
 app.include_router(setup_api_token_routes())
+
+# OXS — Odysseus Extension System
+from core.extensions import ExtensionRegistry
+from routes.oxs_api import setup_oxs_api_routes, setup_oxs_inbound_webhooks
+oxs_registry = ExtensionRegistry(
+    bundled_dir=os.path.abspath(os.path.join(os.path.dirname(__file__) or ".", "extensions")),
+    user_dir=os.path.join(DATA_DIR, "extensions"),
+)
+oxs_registry.bind_app(app)
+app.include_router(setup_oxs_api_routes(oxs_registry))
+app.include_router(setup_oxs_inbound_webhooks())
 
 logger.info("Webhook & API token routes initialized")
 
