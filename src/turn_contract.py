@@ -40,6 +40,19 @@ FAMILY_TOOLS = {
     "transcription": frozenset({"transcribe_media"}),
     "media_inspection": frozenset({"inspect_media"}),
     "ocr": frozenset({"extract_text"}),
+    "messaging": frozenset({
+        "mcp__whats2api__list_connections",
+        "mcp__whats2api__get_connection",
+        "mcp__whats2api__send_message",
+        "mcp__whats2api__send_reaction",
+        "mcp__whats2api__mark_read",
+        "mcp__whats2api__send_presence",
+        "mcp__whats2api__is_on_whatsapp",
+        "mcp__oxs_whats2api_bridge__list_messages",
+        "mcp__oxs_whats2api_bridge__get_message",
+        "mcp__oxs_whats2api_bridge__list_events",
+        "mcp__oxs_whats2api_bridge__list_connections_local",
+    }),
 }
 
 # Retrieval is selection, not authorization. A normal agent turn must retain
@@ -120,6 +133,7 @@ _FAMILY_WORDS = {
     "sessions": r"\b(?:sessions?|chats?|conversations?)\b",
     "ui": r"\b(?:panels?|themes?|toggles?|sidebar)\b",
     "ocr": r"\b(?:ocr|extract|read|recognize|transcribe)\b.{0,32}\b(?:text|words?|labels?|numbers?|digits?|screenshot|scan|image)\b|文字|文本|字幕|编号|数字|标签|票据",
+    "messaging": r"\b(?:whats(?:app|2api)|wpp|zap(?:s|ear|eira)?|api\s+do\s+(?:zap|whats))\b",
 }
 _FUZZY_FAMILY_TERMS = {
     "calendar": ("calendar", "event", "meeting", "appointment", "agenda"),
@@ -4776,6 +4790,18 @@ def requested_capabilities(message: str, history: Iterable = (), *, active_docum
         family for family, pattern in _FAMILY_WORDS.items()
         if re.search(pattern, scope_text, re.I)
     }
+    # "messaging" is a tool-only family (remote/local MCP tools with no
+    # primary-product noun in the request). Grant it as soon as the user
+    # names the integration; do not require an action verb, since phrases
+    # such as "usando o mcp do whats2api envie uma msg" lead with a
+    # gerund and would otherwise fall through to an empty set.
+    # The user named the messaging integration; grant the family. This
+    # also covers explicit tool-name requests (mcp__whats2api__*) and
+    # informal pt-BR phrasings ("manda um whats").
+    if "messaging" in newly_named_families or re.search(
+        r"\bmcp__whats2api__\w+\b", text, re.I,
+    ):
+        return frozenset({"messaging"})
     established_family = immediately_established_family(text, history)
     if established_family and not newly_named_families:
         return frozenset({established_family})
@@ -6303,7 +6329,15 @@ class TurnContract:
                 raise ValueError("Required read operation must be available or explicitly unavailable")
 
     def permits(self, name: str) -> bool:
-        return canonical_tool(name) in {canonical_tool(n) for n in self.offered}
+        raw = str(name or "")
+        # MCP tools are offered by the tool index + caller policy, not by the
+        # built-in turn contract (whose schema inventory covers core
+        # built-ins only). Execution-time checks still enforce tool policy
+        # and disabled lists after this gate, so MCP calls remain subject to
+        # user/server denials.
+        if raw.startswith("mcp__"):
+            return True
+        return canonical_tool(raw) in {canonical_tool(n) for n in self.offered}
 
     def schemas(self) -> list[dict]:
         # Return copies: compact/full model formatting must not mutate the contract.
