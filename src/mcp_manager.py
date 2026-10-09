@@ -855,7 +855,13 @@ class McpManager:
         return schemas
 
     def get_all_tools(self, disabled_map: Optional[Dict[str, set]] = None) -> List[Dict]:
-        """Return a flat list of all discovered tools with server info."""
+        """Return a flat list of all discovered tools with server info.
+
+        Combines out-of-process MCP tools (self._tools, populated by
+        ``connect_all_enabled`` and friends) with in-process tools registered
+        via ``register_in_process_tool`` (e.g. OXS extension ``mcp_tools``).
+        The latter would otherwise be invisible to the agent.
+        """
         result = []
         for server_id, tools in self._tools.items():
             conn = self._connections.get(server_id, {})
@@ -869,6 +875,19 @@ class McpManager:
                     "description": tool.get("description", ""),
                     "input_schema": tool.get("input_schema") or {},
                     "is_disabled": tool["name"] in disabled,
+                })
+        for server_id, tools in self._in_process_tools.items():
+            conn = self._connections.get(server_id, {})
+            disabled = (disabled_map or {}).get(server_id, set())
+            for name, tool in tools.items():
+                result.append({
+                    "server_id": server_id,
+                    "server_name": conn.get("name", server_id),
+                    "name": name,
+                    "qualified_name": f"mcp__{server_id}__{name}",
+                    "description": tool.get("description", ""),
+                    "input_schema": tool.get("input_schema") or {},
+                    "is_disabled": name in disabled,
                 })
         return result
 

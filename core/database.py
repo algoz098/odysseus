@@ -624,6 +624,10 @@ class McpServer(TimestampMixin, Base):
     oauth_config = Column(Text, nullable=True)   # JSON: provider, keys_file, token_file, scopes
     disabled_tools = Column(Text, nullable=True)  # JSON array of tool names to hide from LLM
     oauth_tokens = Column(EncryptedText, nullable=True)  # JSON {tokens, client_info} for generic MCP OAuth, encrypted at rest
+    # NULL for admin-created rows; set to the OXS extension id when the row
+    # is owned by an extension. The framework uses this to clean up
+    # extension-owned rows on uninstall.
+    extension_id = Column(String, nullable=True, index=True)
 
 
 class Comparison(TimestampMixin, Base):
@@ -1059,6 +1063,26 @@ def _migrate_add_session_generation_settings_columns():
     finally:
         if conn is not None:
             conn.close()
+
+
+def _migrate_add_extension_sidebar_visible_column():
+    """Add ``sidebar_visible`` to ``extensions`` for per-extension sidebar opt-in."""
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(extensions)").fetchall()}
+        if "sidebar_visible" not in columns:
+            conn.execute("ALTER TABLE extensions ADD COLUMN sidebar_visible BOOLEAN DEFAULT 0")
+        conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"extension sidebar_visible migration failed: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 def _migrate_add_document_archived_column():
     """Add `archived` to documents (soft-archive flag). Guarded + idempotent."""
@@ -1970,6 +1994,24 @@ def _migrate_add_mcp_oauth_tokens_column():
     except Exception as e:
         logging.getLogger(__name__).warning(f"oauth_tokens migration: {e}")
 
+def _migrate_add_mcp_extension_id_column():
+    """Add extension_id column to mcp_servers table if missing.
+
+    NULL for admin-created rows; set to the OXS extension id when the row is
+    owned by an extension. The registry uses this to clean up extension-owned
+    rows + their live sessions on uninstall.
+    """
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(mcp_servers)"))]
+            if "extension_id" not in cols:
+                conn.execute(text("ALTER TABLE mcp_servers ADD COLUMN extension_id VARCHAR"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_mcp_servers_extension_id ON mcp_servers (extension_id)"))
+                conn.commit()
+                logging.getLogger(__name__).info("Added extension_id column to mcp_servers")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"mcp extension_id migration: {e}")
+
 def _migrate_add_task_v2_columns():
     """Add cron_expression, then_task_id, webhook_token to scheduled_tasks."""
     new_cols = {
@@ -2214,6 +2256,7 @@ class Extension(TimestampMixin, Base):
     installed_by  = Column(String, nullable=True)
     install_error = Column(Text, nullable=True)
     last_enabled_at = Column(DateTime, nullable=True)
+    sidebar_visible = Column(Boolean, default=False, index=True)
 
 
 class ExtensionPermission(TimestampMixin, Base):
@@ -2481,7 +2524,9 @@ def init_db():
     _migrate_add_task_automation_columns()
     _migrate_add_task_authority_column()
     _migrate_add_disabled_tools()
+    _migrate_add_extension_sidebar_visible_column()
     _migrate_add_mcp_oauth_tokens_column()
+    _migrate_add_mcp_extension_id_column()
     _migrate_add_task_v2_columns()
     _migrate_add_notifications_enabled()
     _migrate_drop_ping_notes_tasks()

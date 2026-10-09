@@ -24,9 +24,13 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from src.constants import DATA_EXTENSIONS_DIR, EXTENSIONS_DIR, OXS_PERMISSIONS_DIR
 
@@ -53,6 +57,9 @@ class RunningExtension:
     host: OXSHost
     # Set after enable(); cleared on disable().
     enabled: bool = False
+    # Operator toggle: surface this extension in the user sidebar. Default off;
+    # flipped via the admin panel + persisted in the DB extensions row.
+    sidebar_visible: bool = False
 
 
 class ExtensionRegistry:
@@ -138,6 +145,19 @@ class ExtensionRegistry:
             enabled=False,
         )
         self._extensions[ext.extension_id] = running
+        # Hydrate operator toggles (e.g. sidebar_visible) from the persisted
+        # extensions DB row so UI state survives restarts.
+        try:
+            from core.database import SessionLocal, Extension as _ExtRow
+            with SessionLocal() as db:
+                row = db.query(_ExtRow).filter(_ExtRow.id == ext.extension_id).first()
+                if row is not None:
+                    running.sidebar_visible = bool(row.sidebar_visible)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "sidebar_visible hydrate skipped for %s", ext.extension_id,
+            )
         audit_log(
             "extension.discovered",
             extension_id=ext.extension_id,
@@ -150,6 +170,24 @@ class ExtensionRegistry:
         )
 
     # ── Install ──────────────────────────────────────────────────────────
+
+    def _backup_existing(self, ext_id: str) -> str | None:
+        """If ``data/extensions/<id>/`` exists, move it aside.
+
+        Backs up to ``data/extensions/.bak/<id>-<UTC-ts>/`` so a re-install of
+        an already-installed extension never destroys the previous version
+        silently. Returns the backup path or ``None`` when there was nothing
+        to back up.
+        """
+        target = os.path.join(self.user_dir, ext_id)
+        if not os.path.isdir(target):
+            return None
+        bak_root = os.path.join(self.user_dir, ".bak")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = os.path.join(bak_root, f"{ext_id}-{ts}")
+        os.makedirs(bak_root, exist_ok=True)
+        shutil.move(target, backup)
+        return backup
 
     def install_from_zip(self, zip_path: str, *, operator: str | None = None) -> RunningExtension:
         """Install an extension from a local ZIP file.
@@ -183,6 +221,9 @@ class ExtensionRegistry:
             # Validate the manifest
             manifest = validate_manifest(manifest_bytes)
             ext_id = manifest["id"]
+
+            # Backup existing install (if any) before we overwrite it
+            backup_path = self._backup_existing(ext_id)
 
             # Extract
             target_dir = os.path.join(self.user_dir, ext_id)
@@ -223,6 +264,135 @@ class ExtensionRegistry:
                 "version": manifest["version"],
                 "source": "user",
                 "source_path": target_dir,
+                "via": "zip",
+                "backup": backup_path,
+            },
+        )
+        return running
+
+    def install_from_git(self, url: str, *, operator: str | None = None) -> RunningExtension:
+        """Install an extension from a public https git repository.
+
+        Clones into a temp dir, validates the ``extension.json`` (found at
+        the repo root or inside a single top-level directory), backs up any
+        existing install at ``data/extensions/<id>/``, then moves the source
+        tree into place. Same rescan + persist + audit tail as
+        :meth:`install_from_zip`.
+
+        Only ``https://`` URLs without embedded credentials are accepted.
+        SSH (``git@...``, ``ssh://...``), ``git://``, ``file://``, and any
+        URL carrying ``user:pass@`` are rejected before any subprocess runs.
+        """
+        # 1. URL validation
+        try:
+            parsed = urlparse(url)
+        except ValueError as e:
+            raise ValueError(f"malformed URL: {e}") from None
+        if parsed.scheme != "https":
+            raise ValueError(f"only https URLs are accepted; got scheme {parsed.scheme!r}")
+        if parsed.username or parsed.password:
+            raise ValueError("URL must not contain credentials")
+        if not parsed.netloc or not parsed.path or parsed.path == "/":
+            raise ValueError("URL is missing a repository path")
+
+        # 2. Clone to a temp dir
+        tmp = tempfile.mkdtemp(prefix="oxs-git-")
+        backup_path: str | None = None
+        target_dir = ""
+        try:
+            try:
+                proc = subprocess.run(
+                    ["git", "clone", "--depth=1", "--single-branch", "--", url, tmp],
+                    check=False,
+                    timeout=120,
+                    capture_output=True,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("git clone timed out after 120s") from None
+            except FileNotFoundError:
+                raise RuntimeError("git binary not found on server") from None
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", "replace").strip()
+                raise RuntimeError(
+                    f"git clone failed: {stderr or f'exit {proc.returncode}'}"
+                )
+
+            # 3. Locate extension.json: at the clone root, or inside a single
+            # top-level subdirectory. Refuse to guess if multiple candidates
+            # exist — the author should re-pack the repo so the manifest is
+            # easy to find.
+            candidates: list[str] = []
+            root_manifest = os.path.join(tmp, "extension.json")
+            if os.path.isfile(root_manifest):
+                candidates.append(root_manifest)
+            for entry in sorted(os.listdir(tmp)):
+                full = os.path.join(tmp, entry)
+                if not os.path.isdir(full) or entry.startswith("."):
+                    continue
+                cand = os.path.join(full, "extension.json")
+                if os.path.isfile(cand):
+                    candidates.append(cand)
+            if not candidates:
+                raise ValueError("no extension.json found in cloned repository")
+            if len(candidates) > 1:
+                raise ValueError(
+                    "multiple candidate extension.json found; repo must have a "
+                    "single extension at the root or under a single top-level dir"
+                )
+            manifest_path = candidates[0]
+            source_root = os.path.dirname(manifest_path)
+
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = validate_manifest(f.read())
+            ext_id = manifest["id"]
+
+            # 4. Backup existing install
+            backup_path = self._backup_existing(ext_id)
+
+            # 5. Move source tree into place
+            target_dir = os.path.join(self.user_dir, ext_id)
+            if source_root == tmp:
+                # Manifest at the repo root — move each top-level entry
+                # individually (skipping .git) so the manifest filename is
+                # preserved at data/extensions/<id>/extension.json.
+                os.makedirs(target_dir, exist_ok=True)
+                for entry in os.listdir(tmp):
+                    if entry == ".git":
+                        continue
+                    src = os.path.join(tmp, entry)
+                    dst = os.path.join(target_dir, entry)
+                    if os.path.exists(dst):
+                        if os.path.isdir(dst):
+                            shutil.rmtree(dst)
+                        else:
+                            os.unlink(dst)
+                    shutil.move(src, dst)
+            else:
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                shutil.move(source_root, target_dir)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # 6. Re-discover + persist + audit (mirrors install_from_zip)
+        self.rescan()
+        running = self._extensions.get(ext_id)
+        if running is None:
+            raise RuntimeError(
+                f"install succeeded but discovery did not register {ext_id}"
+            )
+        self._persist_extension_row(running, operator=operator)
+        audit_log(
+            "extension.install",
+            extension_id=ext_id,
+            actor=operator or "system",
+            payload={
+                "version": manifest["version"],
+                "source": "user",
+                "source_path": target_dir,
+                "via": "git",
+                "url": url,
+                "backup": backup_path,
             },
         )
         return running
@@ -376,6 +546,39 @@ class ExtensionRegistry:
             payload={},
         )
 
+    def set_sidebar_visible(
+        self, extension_id: str, visible: bool, *, operator: str | None = None
+    ) -> RunningExtension:
+        """Toggle whether ``extension_id`` appears in the user sidebar.
+
+        Updates both the in-memory :class:`RunningExtension` and the persisted
+        ``extensions`` row so the choice survives restarts. No-op if the
+        extension is not registered.
+        """
+        running = self._extensions.get(extension_id)
+        if running is None:
+            raise KeyError(f"extension not found: {extension_id!r}")
+        running.sidebar_visible = bool(visible)
+        try:
+            from core.database import SessionLocal, Extension as _ExtRow
+            with SessionLocal() as db:
+                row = db.query(_ExtRow).filter(_ExtRow.id == extension_id).first()
+                if row is not None:
+                    row.sidebar_visible = bool(visible)
+                    db.commit()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "OXS set_sidebar_visible persist failed for %s", extension_id,
+            )
+        audit_log(
+            "extension.sidebar_visible",
+            extension_id=extension_id,
+            actor=operator or "system",
+            payload={"visible": bool(visible)},
+        )
+        return running
+
     # ── Wiring helpers ───────────────────────────────────────────────────
 
     def _wire(self, running: RunningExtension) -> None:
@@ -451,6 +654,28 @@ class ExtensionRegistry:
                     running.source_path, st.directory,
                 )
 
+        # HTTP routes declared via host.add_route. Mounted onto the
+        # FastAPI app so the extension's own endpoints become reachable.
+        if host.routes and self._app is not None:
+            from . import route_mount
+            for r in host.routes:
+                try:
+                    route_mount.install(
+                        self._app, ext_id, r.path, r.handler,
+                        auth=r.auth, methods=r.methods,
+                    )
+                    audit_log(
+                        "extension.route.installed",
+                        extension_id=ext_id,
+                        actor="system",
+                        payload={"path": r.path, "methods": list(r.methods), "auth": r.auth},
+                    )
+                except Exception:
+                    import logging as _l
+                    _l.getLogger(__name__).exception(
+                        "OXS route mount failed for %s %s", ext_id, r.path,
+                    )
+
     def _unwire(self, running: RunningExtension) -> None:
         """Reverse of :meth:`_wire`. Removes everything the extension put down."""
         ext_id = running.extension_id
@@ -476,6 +701,11 @@ class ExtensionRegistry:
             from . import ui_mount
             ui_mount.uninstall(self._app, ext_id)
 
+        # HTTP routes mounted in _wire
+        if self._app is not None:
+            from . import route_mount
+            route_mount.uninstall(self._app, ext_id)
+
     # ── App binding (PR 4) ────────────────────────────────────────────────
 
     _app: Any = None
@@ -497,10 +727,19 @@ class ExtensionRegistry:
             return
         if running.enabled:
             self.disable(extension_id, operator=operator)
+        # Run the extension's own cleanup first — it can disconnect MCP
+        # sessions, remove rows from ``mcp_servers``, drop external caches,
+        # etc. We do this BEFORE the framework's automatic cleanup so the
+        # extension can drop things the framework doesn't know about.
         try:
             running.host.hooks.run("on_uninstall")
         except Exception:
             pass
+        # Best-effort automatic cleanup. Each step is wrapped in its own
+        # try/except so a failure in one (e.g. a missing table) doesn't
+        # skip the others. Every failure is audited; the operator sees
+        # the full picture in the audit log.
+        self._cleanup_extension_resources(extension_id, operator=operator)
         audit_log(
             "extension.uninstall",
             extension_id=extension_id,
@@ -511,6 +750,103 @@ class ExtensionRegistry:
         self._delete_extension_row(extension_id)
         # Note: we keep the extension's data dir on disk so operators can
         # recover from a mistake. Cleanup is a separate explicit action.
+
+    def _cleanup_extension_resources(
+        self, extension_id: str, *, operator: str | None,
+    ) -> None:
+        """Best-effort tear-down of resources the extension owned.
+
+        Runs after ``on_uninstall`` so the extension had a chance to do its
+        own cleanup first. Each step is independent — we never let a
+        failure in one block the others. Failures are audited individually
+        so the operator can see exactly what went wrong.
+
+        Cleanup covers:
+
+          1. McpServer rows where ``extension_id == <id>`` (the rows the
+             extension created via direct DB writes) — the live session is
+             disconnected first, then the row is deleted.
+          2. Data tables declared in ``data_schema`` (``<id>__*``) — the
+             spec at ``specs/oxs.md:256`` promises this; PRs before this
+             change kept the tables around for "recovery", which leaked
+             data on every uninstall. Now we drop them. The data dir on
+             disk is still kept — a separate explicit action removes it.
+        """
+        from .audit import audit_log
+
+        # ── 1. McpServer rows owned by this extension ─────────────────────
+        try:
+            from core.database import SessionLocal, McpServer
+            from src.mcp_manager import get_mcp_manager
+            mgr = get_mcp_manager()
+            owned_ids: list[str] = []
+            with SessionLocal() as db:
+                rows = (
+                    db.query(McpServer)
+                    .filter(McpServer.extension_id == extension_id)
+                    .all()
+                )
+                for row in rows:
+                    owned_ids.append(row.id)
+                    db.delete(row)
+                db.commit()
+            # Disconnect live sessions after the DB write so a partial DB
+            # failure doesn't leave a session pointing at a deleted row.
+            for sid in owned_ids:
+                try:
+                    import asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(mgr.disconnect_server(sid))
+                        else:
+                            loop.run_until_complete(mgr.disconnect_server(sid))
+                    except RuntimeError:
+                        # No running loop — best-effort, skip.
+                        pass
+                except Exception as e:
+                    audit_log(
+                        "extension.uninstall.mcp_disconnect_failed",
+                        extension_id=extension_id,
+                        actor=operator or "system",
+                        payload={"server_id": sid, "error": str(e)},
+                    )
+            if owned_ids:
+                audit_log(
+                    "extension.uninstall.mcp_servers_removed",
+                    extension_id=extension_id,
+                    actor=operator or "system",
+                    payload={"server_ids": owned_ids},
+                )
+        except Exception as e:
+            audit_log(
+                "extension.uninstall.mcp_cleanup_failed",
+                extension_id=extension_id,
+                actor=operator or "system",
+                payload={"error": str(e)},
+            )
+
+        # ── 2. Data tables (`<id>__*`) ────────────────────────────────────
+        try:
+            from .migrate import drop_all_for_extension
+            from core.database import engine as _core_engine
+            dropped = drop_all_for_extension(
+                extension_id, engine=_core_engine,
+            )
+            if dropped:
+                audit_log(
+                    "extension.uninstall.tables_dropped",
+                    extension_id=extension_id,
+                    actor=operator or "system",
+                    payload={"tables": dropped},
+                )
+        except Exception as e:
+            audit_log(
+                "extension.uninstall.tables_drop_failed",
+                extension_id=extension_id,
+                actor=operator or "system",
+                payload={"error": str(e)},
+            )
 
     # ── Reload ───────────────────────────────────────────────────────────
 

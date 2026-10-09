@@ -1,0 +1,188 @@
+{
+  "id": "whats2api_bridge",
+  "name": "Whats2API Bridge",
+  "version": "0.5.0",
+  "oxs_version": ">=1.0.0,<2.0.0",
+  "python_deps": [],
+  "author": {
+    "name": "algoz098",
+    "url": "https://github.com/algoz098",
+    "email": ""
+  },
+  "license": "AGPL-3.0-or-later",
+  "repository": "https://github.com/odysseus-dev/odysseus/tree/main/extensions/whats2api_bridge",
+  "description": "WhatsApp via whats2api.com \u2014 list/start/stop sessions, send messages and reactions, and ingest every inbound event (messages.upsert, connection.update, group-participants.update, ...) through an OXS webhook.",
+  "entry_point": "plugin:register",
+  "hooks": [
+    "on_install",
+    "on_enable",
+    "on_disable",
+    "on_uninstall"
+  ],
+  "capabilities": {
+    "data": true,
+    "tools": true,
+    "routes": true,
+    "mcp_tools": true,
+    "webhooks_in": true,
+    "webhooks_out": true,
+    "events_sub": [
+      "oxs.rescan"
+    ],
+    "events_fire": [
+      "whats2api.message.received",
+      "whats2api.message.sent",
+      "whats2api.connection.update",
+      "whats2api.group.update",
+      "whats2api.presence.update",
+      "whats2api.call"
+    ],
+    "ui_panel": true,
+    "static": [
+      {
+        "url_prefix": "/ext-static/whats2api_bridge",
+        "directory": "ui"
+      }
+    ],
+    "settings_read": true
+  },
+  "permissions": {
+    "network_outbound": [
+      "https://api.whats2api.com"
+    ],
+    "filesystem_data_subpath": [
+      "cache"
+    ]
+  },
+  "privileged_permissions": {},
+  "settings_schema": {
+    "type": "object",
+    "properties": {
+      "api_token": {
+        "type": "string",
+        "title": "API token",
+        "description": "Long-lived API token from the whats2api.com dashboard (Dashboard \u2192 API Tokens). Shown only once at creation. 64 hex chars.",
+        "minLength": 8,
+        "maxLength": 256
+      },
+      "base_url": {
+        "type": "string",
+        "title": "API base URL",
+        "default": "https://api.whats2api.com",
+        "description": "Override only if you proxy whats2api.com. Must start with https://.",
+        "pattern": "^https://[A-Za-z0-9._\\-/]+$"
+      },
+      "default_connection_id": {
+        "type": "string",
+        "title": "Default connection ID",
+        "description": "Optional connection to use when a tool call omits connection_id.",
+        "maxLength": 128
+      },
+      "request_timeout_seconds": {
+        "type": "integer",
+        "title": "HTTP timeout",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 300
+      },
+      "retention_days": {
+        "type": "integer",
+        "title": "Event log retention (days)",
+        "default": 7,
+        "minimum": 1,
+        "maximum": 365
+      },
+      "log_inbound_events": {
+        "type": "boolean",
+        "title": "Persist every inbound event",
+        "default": true,
+        "description": "If true, every whats2api event is stored in the events table."
+      }
+    },
+    "additionalProperties": false,
+    "required": [
+      "api_token",
+      "base_url"
+    ]
+  },
+  "data_schema": {
+    "connections": {
+      "columns": {
+        "id": "TEXT PRIMARY KEY",
+        "name": "TEXT",
+        "engine": "TEXT",
+        "phone": "TEXT",
+        "status": "TEXT",
+        "owner_id": "TEXT",
+        "raw_json": "TEXT",
+        "updated_at": "INTEGER NOT NULL"
+      },
+      "indexes": [
+        [
+          "status"
+        ],
+        [
+          "owner_id"
+        ]
+      ]
+    },
+    "messages": {
+      "columns": {
+        "id": "TEXT PRIMARY KEY",
+        "connection_id": "TEXT NOT NULL",
+        "direction": "TEXT NOT NULL",
+        "remote_jid": "TEXT",
+        "from_me": "TEXT",
+        "chat_jid": "TEXT",
+        "sender_jid": "TEXT",
+        "push_name": "TEXT",
+        "text": "TEXT",
+        "message_type": "TEXT",
+        "ts": "INTEGER NOT NULL",
+        "raw_json": "TEXT"
+      },
+      "indexes": [
+        [
+          "connection_id",
+          "ts"
+        ],
+        [
+          "chat_jid",
+          "ts"
+        ],
+        [
+          "direction"
+        ]
+      ],
+      "unique": [
+        [
+          "id"
+        ]
+      ]
+    },
+    "events": {
+      "columns": {
+        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "event_name": "TEXT NOT NULL",
+        "connection_id": "TEXT",
+        "user_id": "TEXT",
+        "received_at": "INTEGER NOT NULL",
+        "raw_json": "TEXT"
+      },
+      "indexes": [
+        [
+          "event_name",
+          "received_at"
+        ],
+        [
+          "connection_id",
+          "received_at"
+        ]
+      ]
+    }
+  },
+  "file_hashes": {
+    "plugin.py": "sha256:5acfd0d973191572a02095ce8fda42d7f221b0749102aad8c3685424e8c93f47",
+    "ui/index.html": "sha256:92a5675a405a7b5c643341e3fb3cd27a62eab55f5ec94d107f2e2e79a6428795"
+  }
+}

@@ -179,6 +179,42 @@ class PluginStorage:
             result = conn.execute(text(sql), values)
             return int(result.lastrowid or 0)
 
+    def execute_write(self, sql: str, params: dict | tuple | None = None) -> int:
+        """Run a DELETE/UPDATE/INSERT against this extension's own tables.
+
+        Same prefix-safety as :meth:`execute_raw` but the head verb is
+        restricted to writes. Returns the affected row count.
+        """
+        if not isinstance(sql, str):
+            raise TypeError("execute_write requires str")
+        stripped = sql.strip()
+        head = stripped.split(None, 1)[0].upper() if stripped else ""
+        if head not in ("INSERT", "UPDATE", "DELETE"):
+            raise OXSStorageError(
+                f"execute_write only accepts INSERT/UPDATE/DELETE (got {head!r})"
+            )
+        # Reuse the prefix wall: collect real table names touched by
+        # the FROM/JOIN/UPDATE/INSERT-INTO clauses.
+        import re as _re
+        owned = self._prefix
+        bad: list[str] = []
+        for match in _re.finditer(
+            r"\b(?:FROM|JOIN|UPDATE|INTO)\s+`?\"?([A-Za-z_][\w]*)",
+            stripped,
+            _re.IGNORECASE,
+        ):
+            ident = match.group(1)
+            if not ident.startswith(owned):
+                bad.append(ident)
+        if bad:
+            raise OXSStorageError(
+                f"execute_write must only touch own tables (prefix {owned!r}); "
+                f"found: {bad}"
+            )
+        with self.engine.begin() as conn:
+            result = conn.execute(text(stripped), params or {})
+            return int(result.rowcount or 0)
+
     def execute_raw(self, sql: str, params: dict | None = None) -> list[dict]:
         """Run a SELECT against this extension's own tables only.
 

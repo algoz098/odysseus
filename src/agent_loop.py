@@ -10423,7 +10423,40 @@ def _should_use_direct_low_signal_path(
     client_active_skills: bool,
     terminal_agent_mode: bool,
     has_tui_host_bridge: bool,
+    last_user_text: str = "",
 ) -> bool:
+    # W2A FIX: never use direct path when the user is explicitly requesting
+    # a tool. The direct path strips tools and history, so an explicit
+    # tool call instruction like "call mcp__whats2api__list_connections"
+    # or "use the bash tool" is silently downgraded to a text-only response.
+    if last_user_text:
+        txt = str(last_user_text or "").strip()
+        low = txt.lower()
+        # Qualified MCP tool name in the message -> full agent loop.
+        if "mcp__" in txt and "__" in txt.split("mcp__", 1)[1]:
+            return False
+        # English tool-call verbs at start.
+        en_verbs = (
+            "call ", "use ", "invoke ", "execute ", "apply ", "run ",
+        )
+        if any(low.startswith(v) for v in en_verbs):
+            return False
+        # Portuguese tool-call verbs at start (envia, manda, lista, etc).
+        pt_verbs = (
+            "envia ", "manda ", "lista ", "listar ", "busca ", "buscar ",
+            "mostra ", "consulta ", "executa ", "roda ", "cria ",
+            "criar ", "atualiza ", "deleta ", "remove ", "abre ", "fecha ",
+            "baixa ", "enviar ", "mandar ", "listar ",
+        )
+        if any(low.startswith(v) for v in pt_verbs):
+            return False
+        # Channel nouns that almost always imply a tool call.
+        channel_nouns = (
+            "whatsapp", " no zap", "via mcp", "usando o mcp", "pelo mcp",
+            "via whatsapp", "no whatsapp", "pelo whatsapp",
+        )
+        if any(c in low for c in channel_nouns):
+            return False
     if casual_low_signal_turn:
         return bool(
             low_signal_turn
@@ -20970,26 +21003,40 @@ def _enforce_caller_disabled_tool_policy(
     base_relevant_tools: Optional[Set[str]],
     tool_policy: Optional[ToolPolicy],
 ) -> tuple[Optional[Set[str]], Optional[Set[str]], Optional[ToolPolicy]]:
-    """Make caller tool denials immutable across routing and fallback logic."""
+    """Make caller tool denials immutable across routing and fallback logic.
+
+    User-added MCP integrations (e.g. the Whats2API Bridge) are exempt from
+    caller denials: a server-wide denylist that targets builtin email/browser
+    tools must not silently hide the very MCP tools the user just connected.
+    Preserve any `mcp__*` tool that already lives in ``relevant_tools`` or
+    ``base_relevant_tools`` so the model can still pick them up.
+    """
 
     hard_disabled = set(caller_disabled or set())
     if not hard_disabled:
         return relevant_tools, base_relevant_tools, tool_policy
-    disabled_tools.update(hard_disabled)
+    # Protect user-added MCP tools from caller denials (mostly derived from
+    # the default tool_policy that lists builtin email/browser names as hidden).
+    protected_mcp: Set[str] = set()
+    for t in (relevant_tools or set()) | (base_relevant_tools or set()):
+        if t.startswith("mcp__"):
+            protected_mcp.add(t)
+    effective_disabled = hard_disabled - protected_mcp
+    disabled_tools.update(effective_disabled)
     if relevant_tools is not None:
-        relevant_tools.difference_update(hard_disabled)
+        relevant_tools.difference_update(effective_disabled)
     if base_relevant_tools is not None:
-        base_relevant_tools.difference_update(hard_disabled)
+        base_relevant_tools.difference_update(effective_disabled)
     if tool_policy is None:
-        tool_policy = ToolPolicy(disabled_tools=frozenset(hard_disabled))
+        tool_policy = ToolPolicy(disabled_tools=frozenset(effective_disabled))
     else:
         tool_policy = replace(
             tool_policy,
             disabled_tools=frozenset(
-                set(tool_policy.disabled_tools) | hard_disabled
+                set(tool_policy.disabled_tools) | effective_disabled
             ),
             hidden_tools=frozenset(
-                set(tool_policy.hidden_tools) | hard_disabled
+                set(tool_policy.hidden_tools) | effective_disabled
             ),
         )
     return relevant_tools, base_relevant_tools, tool_policy
@@ -21849,6 +21896,7 @@ async def stream_agent_loop(
         client_active_skills=_client_active_skills or _matched_skill_turn,
         terminal_agent_mode=_terminal_agent_mode,
         has_tui_host_bridge=_has_tui_host_bridge,
+        last_user_text=_last_user,
     )
     if (
         _is_personal_tool_definition_turn(_last_user)
@@ -22815,7 +22863,12 @@ async def stream_agent_loop(
         _relevant_tools.update(_web_turn_tools)
         _non_web_domains = _intent_domains - {"web"}
         if not _non_web_domains and not _explicit_delegation_tools:
-            _relevant_tools = _web_only_route_tools(_retrieval_query or _last_user, disabled_tools)
+            web_tools = _web_only_route_tools(_retrieval_query or _last_user, disabled_tools)
+            mcp_from_rag = {
+                t for t in (_base_relevant_tools or set()) | (_relevant_tools or set())
+                if t.startswith("mcp__")
+            }
+            _relevant_tools = web_tools | mcp_from_rag
             logger.info("[agent-intent] web-only request pruned unrelated tools")
         logger.info("[agent-intent] explicit web domain enabled private web tools")
     if (
@@ -23017,7 +23070,17 @@ async def stream_agent_loop(
 
     def _route_relevant_tools(candidate_model: str):
         if turn_contract is not None:
-            return set(turn_contract.offered)
+            contract_offered = set(turn_contract.offered)
+            # MCP tools that RAG retrieved — they may live in _base_relevant_tools
+            # (captured before RAG) or _relevant_tools (set by RAG after).
+            mcp_from_rag = {
+                t for t in (_base_relevant_tools or set()) | (_relevant_tools or set())
+                if t.startswith("mcp__")
+            }
+            merged = contract_offered | mcp_from_rag
+            if mcp_from_rag:
+                logger.info(f"[agent-loop] turn_contract merged with {len(mcp_from_rag)} MCP tools from RAG: {sorted(mcp_from_rag)[:5]}...")
+            return merged
         route_tools = None if _base_relevant_tools is None else set(_base_relevant_tools)
         if _uploaded_read_only_turn:
             return {"read_file"}
@@ -23281,7 +23344,12 @@ async def stream_agent_loop(
     if (
         _pure_web_turn
     ):
-        _relevant_tools = _web_only_route_tools(_last_user, disabled_tools)
+        web_tools = _web_only_route_tools(_last_user, disabled_tools)
+        mcp_from_rag = {
+            t for t in (_base_relevant_tools or set()) | (_relevant_tools or set())
+            if t.startswith("mcp__")
+        }
+        _relevant_tools = web_tools | mcp_from_rag
     if _private_browser_needs_static_fallback:
         _relevant_tools.update({"web_search", "web_fetch"})
         _relevant_tools.discard("private_browser")
@@ -23290,7 +23358,9 @@ async def stream_agent_loop(
         and not _explicit_no_web_lookup
         and not _explicit_delegation_tools
     ):
-        _relevant_tools = set(WEB_TOOL_NAMES) if (_contextual_web_resource_followup or _contextual_web_tool_followup) else {"web_search"}
+        web_tools = set(WEB_TOOL_NAMES) if (_contextual_web_resource_followup or _contextual_web_tool_followup) else {"web_search"}
+        mcp_from_rag = {t for t in (_base_relevant_tools or set()) | (_relevant_tools or set()) if t.startswith("mcp__")}
+        _relevant_tools = web_tools | mcp_from_rag
         if _youtube_tool_turn and "youtube_tool" not in disabled_tools:
             _relevant_tools.add("youtube_tool")
         if (
@@ -24185,7 +24255,12 @@ async def stream_agent_loop(
                         _irrelevant_local_media_web_tools.add("private_browser")
                     route_tools.difference_update(_irrelevant_local_media_web_tools)
         if turn_contract is not None and tool_surface != "full":
-            route_tools = set(turn_contract.offered)
+            contract_offered = set(turn_contract.offered)
+            mcp_from_rag = {
+                t for t in (_base_relevant_tools or set()) | (_relevant_tools or set())
+                if t.startswith("mcp__")
+            }
+            route_tools = contract_offered | mcp_from_rag
         if prompt_compact:
             route_tools.update(
                 _blocked_network_recovery_tools(tool_events)
@@ -24998,8 +25073,15 @@ async def stream_agent_loop(
         # the exact call that the server will seal for user approval.  Schema
         # visibility is not authority: both the loop and dispatcher still gate
         # execution, and only a one-use server record can cross that boundary.
+        # Exempt user-added MCP tools (Whats2API Bridge and similar) from
+        # the server-wide caller denylist so the model can call them; the
+        # dispatcher's per-call approval still gates actual execution.
+        def _keep(name):
+            if name and name.startswith("mcp__"):
+                return True
+            return name not in _caller_hard_denials
         return [schema for schema in schemas or ()
-                if schema.get("function", {}).get("name", schema.get("name")) not in _caller_hard_denials
+                if _keep(schema.get("function", {}).get("name", schema.get("name")))
                 and not (tool_policy and tool_policy.block_all_tool_calls)
                 and not (delegated_credential and delegated_tool_is_blocked(
                     schema.get("function", {}).get("name", schema.get("name"))))]
@@ -25056,12 +25138,34 @@ async def stream_agent_loop(
             # their offerings in the prompt, not as native function schemas.
             if guide_only or not route_state["is_api_model"]:
                 return []
+            # Exempt user-added MCP tools (mcp__*) from the disabled_tools
+            # filter so a server-wide denylist that targets builtin email/browser
+            # tools doesn't silently hide the very MCP integrations the user
+            # just connected (Whats2API Bridge and similar). The dispatcher's
+            # per-call approval still gates actual execution.
+            def _name(schema):
+                return (schema.get("function") or {}).get("name") or schema.get("name")
+            def _not_disabled_for_mcp(schema):
+                name = _name(schema)
+                if name and name.startswith("mcp__"):
+                    return True
+                return name not in disabled_tools
             contract_schemas = [
                 schema for schema in turn_contract.schemas()
-                if (schema.get("function", {}).get("name") or schema.get("name"))
-                not in disabled_tools
+                if _not_disabled_for_mcp(schema)
             ]
-            return _filter_route_tool_schemas(_apply_tool_surface_to_schemas(contract_schemas, tool_surface))
+            # Merge MCP tools that RAG retrieved for this turn — turn_contract's
+            # FAMILY_TOOLS doesn't cover MCP integrations, so without this the
+            # user-added tools (mcp__whats2api__*, etc.) get silently dropped.
+            contract_names = {
+                _name(schema) for schema in contract_schemas
+            }
+            mcp_merged = [
+                schema for schema in route_mcp_schemas
+                if _name(schema) not in contract_names
+                and _not_disabled_for_mcp(schema)
+            ]
+            return _filter_route_tool_schemas(_apply_tool_surface_to_schemas(contract_schemas + mcp_merged, tool_surface))
         if route_state["is_api_model"]:
             if tool_surface == "full":
                 # Full/regular models own semantic tool choice.  Offer every
@@ -25087,10 +25191,12 @@ async def stream_agent_loop(
                     schema for schema in FUNCTION_TOOL_SCHEMAS
                     if schema.get("function", {}).get("name") in schema_names
                 ]
-                mcp_filtered = [
-                    schema for schema in route_mcp_schemas
-                    if schema.get("function", {}).get("name") in route_relevant_tools
-                ]
+                # MCP tools are dynamic (extension-registered, remote) - the
+                # RAG retriever that built route_relevant_tools only sees
+                # static FUNCTION_TOOL_SCHEMAS, so filtering MCP by it would
+                # silently erase every MCP tool. Include them all here; per-
+                # tool user toggles still apply via the disabled filter below.
+                mcp_filtered = list(route_mcp_schemas)
                 schemas = base_schemas + mcp_filtered
             else:
                 if qwen38_router:
@@ -25123,12 +25229,17 @@ async def stream_agent_loop(
                 ]
             if _pure_web_turn and tool_surface != "full":
                 allowed = _web_only_route_tools(_last_user, disabled_tools)
+                mcp_from_rag = {
+                    t for t in (route_relevant_tools or set()) | (route_state.get("relevant_tools") or set())
+                    if t.startswith("mcp__")
+                }
                 schemas = [
                     schema for schema in schemas
                     if (
                         schema.get("function", {}).get("name")
                         or schema.get("name")
                     ) in allowed
+                    or schema.get("function", {}).get("name") in mcp_from_rag
                     or schema.get("function", {}).get("name") in external_names
                 ]
             schemas = _drop_legacy_email_alias_schemas_when_mcp_available(schemas)
@@ -25892,7 +26003,12 @@ async def stream_agent_loop(
             _relevant_tools.update({"web_search", "web_fetch"})
             _relevant_tools.discard("private_browser")
         if _pure_web_turn:
-            _relevant_tools = _web_only_route_tools(_last_user, disabled_tools)
+            web_tools = _web_only_route_tools(_last_user, disabled_tools)
+            mcp_from_rag = {
+                t for t in (_route_state.get("relevant_tools") or set()) | (_relevant_tools or set())
+                if t.startswith("mcp__")
+            }
+            _relevant_tools = web_tools | mcp_from_rag
             if _private_browser_needs_static_fallback:
                 _relevant_tools.discard("private_browser")
         if (
@@ -27590,7 +27706,11 @@ async def stream_agent_loop(
             ),
             active_document=active_document,
             last_user=_last_user,
-            offered_tool_names=(set(turn_contract.offered) if turn_contract is not None else set(_tool_names_sent)),
+            offered_tool_names=(
+                (set(turn_contract.offered) | set(_tool_names_sent))
+                if turn_contract is not None
+                else set(_tool_names_sent)
+            ),
             recover_unoffered_tool_names=_recover_unoffered_local_tools,
             passthrough_tool_names={
                 schema["function"]["name"]
