@@ -1177,6 +1177,24 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
 
+    # OXS extensions — re-enable anything that was enabled at last shutdown.
+    # In-process MCP registrations live in process memory, so without this
+    # every ``mcp__oxs_*`` tool the LLM still sees in its schema would
+    # silently start returning ``MCP server not connected: oxs_*`` after a
+    # container restart, which is the exact "tools" on this bug (the
+    # extension's MCP tools vanish on restart). We run it after the MCP
+    # task so the McpManager is ready to receive register_in_process_tool.
+    async def _startup_oxs_extensions():
+        try:
+            await asyncio.to_thread(oxs_registry.restore_enabled_state)
+        except BaseException as e:
+            logger.warning(
+                f"OXS extension auto-enable failed (non-critical): "
+                f"{type(e).__name__}: {e}"
+            )
+
+    _startup_tasks.append(asyncio.create_task(_startup_oxs_extensions()))
+
     # Semantic tool selection is part of the agent serving contract. Initialize
     # it in a background thread by default so startup remains nonblocking while
     # harness deployments can wait for the explicit readiness state.

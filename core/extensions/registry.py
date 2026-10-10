@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -122,6 +123,59 @@ class ExtensionRegistry:
                 continue
             self._register_discovered(ext)
         return self.list()
+
+    def restore_enabled_state(self) -> list[str]:
+        """Re-enable every extension that was enabled at last shutdown.
+
+        OXS in-process MCP registrations live in process memory, so a
+        container restart silently drops them and every ``mcp__oxs_*`` tool
+        call afterwards returns ``MCP server not connected: oxs_*`` even
+        though the LLM still sees the tools in its schema (cached /
+        re-discovered at next turn). This walks the persisted ``extensions``
+        table and re-enables anything that was marked ``is_enabled=true``,
+        so the in-process handlers and FastAPI mounts come back without an
+        operator round-trip to ``/api/oxs/extensions/{id}/enable``.
+
+        Idempotent — extensions already enabled are skipped. Failures are
+        logged and isolated; one broken entry can't block the others.
+        """
+        # rescan first so a freshly installed extension can be auto-enabled
+        # in the same startup pass.
+        self.rescan()
+
+        try:
+            from core.database import SessionLocal, Extension as _ExtRow
+            with SessionLocal() as db:
+                rows = db.query(_ExtRow).filter(_ExtRow.is_enabled == True).all()
+                ids = [r.id for r in rows]
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "OXS restore_enabled_state: extension table read failed"
+            )
+            return []
+
+        restored: list[str] = []
+        for ext_id in ids:
+            try:
+                running = self._extensions.get(ext_id)
+                if running is None:
+                    # Extension was installed but the source vanished
+                    # between shutdown and startup (e.g. user wiped the
+                    # bundled copy). Skip silently — nothing to enable.
+                    continue
+                if running.enabled:
+                    continue
+                self.enable(ext_id, operator="system")
+                restored.append(ext_id)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "OXS auto-enable failed for %s", ext_id
+                )
+        if restored:
+            logging.getLogger(__name__).info(
+                "OXS auto-restored enabled extensions: %s", restored
+            )
+        return restored
 
     def _register_discovered(self, ext: DiscoveredExtension) -> None:
         """Add a discovered extension to the in-memory registry (not enabled)."""

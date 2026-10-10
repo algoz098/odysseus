@@ -368,3 +368,98 @@ def test_enable_dispatches_event_fires_to_event_bus(registry, tmp_path):
 
     after = len([e for e in audit_query(event_prefix="extension.event_fired")])
     assert after > before, "fire_event should have produced an audit entry"
+
+
+def test_in_process_mcp_seals_resource_identity(registry, tmp_path):
+    """In-process MCP tools must seal a resource identity so the approval
+    gate (``resolve_backend`` → ``manager.resource_identity``) can admit
+    them instead of raising ``ResourceIdentityError`` and silently emitting
+    an unrunnable approval card.
+    """
+    from src.mcp_manager import get_mcp_manager as McpManager
+    m = McpManager()
+
+    plugin = (
+        "def register(host):\n"
+        "    @host.on_enable\n"
+        "    def _e():\n"
+        "        host.register_mcp_tool('w2a', 'greet', "
+        "        {'type': 'object', 'properties': {'name': {'type': 'string'}}}, "
+        "        lambda args, ctx=None: {'hi': args.get('name')})\n"
+    )
+    user = str(tmp_path / "user")
+    _write_user_ext(user, "ext1", plugin, **{
+        "capabilities": {"mcp_tools": True},
+    })
+    registry.rescan()
+    registry.enable("ext1")
+
+    identity = m.resource_identity("mcp__oxs_ext1__greet")
+    assert identity is not None, "expected in-process tool to seal a resource identity"
+    # Namespace and tool name round-trip.
+    assert identity.namespace == "mcp"
+    assert identity.server_id == "oxs_ext1"
+    assert identity.tool_id == "mcp__oxs_ext1__greet"
+    assert identity.endpoint_id.startswith("inproc:")
+
+    # Identity is stable across repeated lookups within the same install —
+    # the approval binding depends on this not rotating under the gate.
+    again = m.resource_identity("mcp__oxs_ext1__greet")
+    assert identity == again
+
+    # Unknown tool on the same server does not seal.
+    assert m.resource_identity("mcp__oxs_ext1__nope") is None
+
+
+def test_disable_in_process_clears_resource_identity(registry, tmp_path):
+    from src.mcp_manager import get_mcp_manager as McpManager
+    m = McpManager()
+
+    plugin = (
+        "def register(host):\n"
+        "    @host.on_enable\n"
+        "    def _e():\n"
+        "        host.register_mcp_tool('w2a', 'greet', "
+        "        {'type': 'object'}, "
+        "        lambda args, ctx=None: 'hi')\n"
+    )
+    user = str(tmp_path / "user")
+    _write_user_ext(user, "ext1", plugin, **{
+        "capabilities": {"mcp_tools": True},
+    })
+    registry.rescan()
+    registry.enable("ext1")
+    assert m.resource_identity("mcp__oxs_ext1__greet") is not None
+
+    registry.disable("ext1")
+    # Tear-down must empty the resource identity too — otherwise a stale
+    # approval could be replayed against an uninstalled server.
+    assert m.resource_identity("mcp__oxs_ext1__greet") is None
+
+
+def test_register_in_process_tool_idempotent_across_tools(registry, tmp_path):
+    """Registering multiple tools for the same in-process server must
+    share one resource-identity tuple — re-registration must not rotate
+    the uuid mid-install.
+    """
+    from src.mcp_manager import get_mcp_manager as McpManager
+    from src.mcp_manager import _INPROC_SESSION
+    from core.extensions import mcp_bridge
+    m = McpManager()
+
+    m.register_in_process_tool(
+        "ext1", "alpha",
+        input_schema={"type": "object"}, description="a",
+        handler=lambda args, ctx=None: "a",
+    )
+    uuid_a = m._resource_connections["ext1"][1]
+    m.register_in_process_tool(
+        "ext1", "beta",
+        input_schema={"type": "object"}, description="b",
+        handler=lambda args, ctx=None: "b",
+    )
+    uuid_b = m._resource_connections["ext1"][1]
+    assert uuid_a == uuid_b, "second registration rotated the server uuid"
+    assert m._sessions.get("ext1") is _INPROC_SESSION
+    # Clean up so the autouse fixture does not see leftovers.
+    m.unregister_in_process_tools("ext1")

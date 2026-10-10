@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 
 BROWSER_MCP_SERVER_ID = "builtin_browser"
 
+# In-process MCP servers (OXS extensions) need a stable sentinel for the
+# ``self._sessions.get(server) is record[2]`` check in ``resource_identity``
+# — there's no ClientSession for an in-process install. A module-level
+# ``object`` makes ``is`` stable without polluting identity semantics.
+_INPROC_SESSION = object()
+
 
 def browser_mcp_call_timeout() -> float:
     """Upper bound for one Playwright MCP tool call, in seconds."""
@@ -534,7 +540,16 @@ class McpManager:
         ``handler`` is ``async def handler(arguments: dict) -> Any`` (or sync).
         ``input_schema`` is the JSON Schema the LLM sees. ``description``
         is what shows up next to the tool name in the function-calling UI.
+
+        Also seals a stable resource identity for the server (endpoint,
+        incarnation, owner) so the approval gate's
+        :meth:`resource_identity` returns a usable ``ExternalResource`` for
+        calls like ``mcp__<server>__<tool>``. Without this, in-process
+        extensions cannot be admitted through the sealed-approval flow
+        even though ``call_tool`` would happily dispatch them.
         """
+        from src.agent_runtime.remote_resources import configuration_incarnation
+        from uuid import uuid4
         if server_id not in self._in_process_tools:
             self._in_process_tools[server_id] = {}
         # Make sure the connection entry exists so the OpenAI schema
@@ -552,12 +567,50 @@ class McpManager:
             "description": description,
             "handler": handler,
         }
+        # Seal resource identity for the approval gate. Idempotent across
+        # re-registrations of the same server: only the *first* tool of a
+        # server seals the endpoint tuple so re-registration does not
+        # rotate the uuid or break a pending approval's binding.
+        endpoint_entry = (f"inproc:{server_id}", configuration_incarnation(("inproc", server_id)))
+        is_first_tool_for_server = server_id not in self._resource_endpoints
+        self._resource_endpoints[server_id] = endpoint_entry
+        self._resource_owners.setdefault(server_id, "")
+        # ``resource_identity`` checks ``self._sessions.get(server) is
+        # record[2]``. There's no real session for an in-process install,
+        # so we point both sides at the module-level sentinel.
+        self._sessions[server_id] = _INPROC_SESSION
+        if is_first_tool_for_server:
+            self._resource_connections[server_id] = (
+                endpoint_entry, uuid4().hex, _INPROC_SESSION,
+                self._resource_owners[server_id],
+            )
+        # Mirror the schema list so the ``any(row.get('name') == tool for
+        # row in self._tools.get(server, []))`` check in
+        # ``resource_identity`` succeeds for in-process tools too.
+        existing = self._tools.get(server_id) or []
+        # Dedup in case the same tool gets re-registered.
+        if not any(row.get("name") == tool_name for row in existing):
+            existing.append({
+                "name": tool_name,
+                "description": description,
+                "input_schema": input_schema,
+            })
+        self._tools[server_id] = existing
         self._generation += 1
 
     def unregister_in_process_tools(self, server_id: str) -> int:
         """Remove every tool belonging to ``server_id``. Returns count."""
         removed = len(self._in_process_tools.get(server_id, {}))
         self._in_process_tools.pop(server_id, None)
+        # Tear down the resource identity sealed at install time so a
+        # re-enable re-seals with a fresh uuid and stale approvals cannot
+        # be replayed against the same address.
+        self._resource_endpoints.pop(server_id, None)
+        self._resource_connections.pop(server_id, None)
+        self._resource_owners.pop(server_id, None)
+        if self._sessions.get(server_id) is _INPROC_SESSION:
+            self._sessions.pop(server_id, None)
+        self._tools.pop(server_id, None)
         # Clean up the connection entry we added. We leave _connections
         # alone if it pre-existed and was modified by us — operators may
         # have other tools there. For the in-process-only case, the entry
@@ -804,7 +857,19 @@ class McpManager:
         disabled_map: optional {server_id: set_of_disabled_tool_names} to filter out.
         """
         schemas = []
+        # Server ids whose schemas live in ``_in_process_tools`` are also
+        # mirrored into ``_tools`` (so ``resource_identity`` can resolve them
+        # through the existing subprocess-style validation). Emit each such
+        # server from the in-process loop only — skipping it here prevents
+        # the model from seeing the same tool under the same qualified name
+        # twice, which providers like MiniMax reject with empty responses.
+        in_process_servers = set(self._in_process_tools.keys())
         for server_id, tools in self._tools.items():
+            # In-process OXS servers are emitted from the loop below; skip
+            # the duplicate mirror in ``_tools`` so each tool name appears
+            # exactly once in the schemas list.
+            if server_id in in_process_servers:
+                continue
             # Skip builtin Python servers — they use the code-block tool format
             # But include NPX-based builtins (like browser) which need function calling
             # Builtin email tools participate in the native Qwen contract.
@@ -861,9 +926,22 @@ class McpManager:
         ``connect_all_enabled`` and friends) with in-process tools registered
         via ``register_in_process_tool`` (e.g. OXS extension ``mcp_tools``).
         The latter would otherwise be invisible to the agent.
+
+        In-process tools are mirrored into ``_tools`` so ``resource_identity``
+        can resolve them through the existing subprocess-style validation.
+        Skip the mirror here so each tool name appears exactly once — emitting
+        duplicates caused the tool_index lane to reject the batch (UPSERT
+        "IDs must be unique") and showed the same tool name twice in the
+        prose catalog that gets injected into the agent prompt.
         """
         result = []
+        in_process_servers = set(self._in_process_tools.keys())
         for server_id, tools in self._tools.items():
+            # In-process OXS servers are emitted from the loop below; skip
+            # the duplicate mirror in ``_tools`` so each tool name appears
+            # exactly once in the catalog.
+            if server_id in in_process_servers:
+                continue
             conn = self._connections.get(server_id, {})
             disabled = (disabled_map or {}).get(server_id, set())
             for tool in tools:
