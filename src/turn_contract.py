@@ -133,7 +133,7 @@ _FAMILY_WORDS = {
     "sessions": r"\b(?:sessions?|chats?|conversations?)\b",
     "ui": r"\b(?:panels?|themes?|toggles?|sidebar)\b",
     "ocr": r"\b(?:ocr|extract|read|recognize|transcribe)\b.{0,32}\b(?:text|words?|labels?|numbers?|digits?|screenshot|scan|image)\b|文字|文本|字幕|编号|数字|标签|票据",
-    "messaging": r"\b(?:whats(?:app|2api)|wpp|zap(?:s|ear|eira)?|api\s+do\s+(?:zap|whats))\b",
+    "messaging": r"\b(?:whats(?:app|2api(?:_bridge)?)|wpp|zap(?:s|ear|eira)?|api\s+do\s+(?:zap|whats))\b|oxs_whats2api_bridge",
 }
 _FUZZY_FAMILY_TERMS = {
     "calendar": ("calendar", "event", "meeting", "appointment", "agenda"),
@@ -4799,7 +4799,7 @@ def requested_capabilities(message: str, history: Iterable = (), *, active_docum
     # also covers explicit tool-name requests (mcp__whats2api__*) and
     # informal pt-BR phrasings ("manda um whats").
     if "messaging" in newly_named_families or re.search(
-        r"\bmcp__whats2api__\w+\b", text, re.I,
+        r"\bmcp__(?:oxs_)?whats2api(?:_bridge)?__\w+\b", text, re.I,
     ):
         return frozenset({"messaging"})
     established_family = immediately_established_family(text, history)
