@@ -2400,7 +2400,27 @@ async def _execute_tool_block_impl(
     elif tool.startswith("mcp__"):
         # MCP tool dispatch
         mcp = get_mcp_manager()
-        if mcp:
+        # Dedup: an exact-approval replay already executed this MCP tool once
+        # and recorded the result in ``_approved_mcp_results`` (populated by
+        # src/agent_loop.py around the approval path). When the model re-emits
+        # the same call on the next round (some compact routers do this even
+        # after seeing the tool result in messages), return the cached
+        # result instead of firing a second outbound request. This is the
+        # inverse direction of the model-side block — the model can call the
+        # tool freely (so the agent still sees a clean conversation), but a
+        # duplicate dispatch is dropped silently.
+        _approved_mcp_results_map: dict = {}
+        try:
+            from src.agent_loop import get_approved_mcp_results  # type: ignore
+            _approved_mcp_results_map = get_approved_mcp_results()
+        except Exception:
+            pass
+        _cached_key = (tool, (content or "").strip())
+        cached = _approved_mcp_results_map.get(_cached_key)
+        if cached is not None:
+            desc = f"mcp: {tool}"
+            result = dict(cached)
+        elif mcp:
             desc = f"mcp: {tool}"
             args, parse_error = _parse_qualified_mcp_args(tool, content)
             if parse_error:

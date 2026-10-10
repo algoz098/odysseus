@@ -113,6 +113,28 @@ from src.agent_tools import (
 )
 
 
+# Approval-replay MCP result cache. Populated when the approval replay
+# path (block above) successfully executes an MCP tool under a sealed
+# approval, and consulted by ``src/tool_execution.py`` when the model
+# re-emits the same MCP call on a subsequent round. This decouples
+# "loop must reach the model so it can produce a final answer" from
+# "duplicate dispatch must not fire a second outbound request". The
+# dict is keyed by ``(qualified_tool_name, raw_content)`` so two
+# distinct calls with different args don't shadow each other.
+_APPROVED_MCP_RESULTS: dict[tuple[str, str], dict] = {}
+
+
+def get_approved_mcp_results() -> dict[tuple[str, str], dict]:
+    """Return the module-level approval-replay MCP result cache.
+
+    Imported by ``src/tool_execution.py`` so MCP dispatch can return the
+    cached payload when the model re-emits the exact same call after an
+    approval replay. Kept as a function (rather than direct attribute
+    access) so the import surface stays small and tests can stub it.
+    """
+    return _APPROVED_MCP_RESULTS
+
+
 def _local_media_discovery_call_allowed(tool_name: str, command: str) -> bool:
     """Allow harmless workspace discovery before media evidence is acquired.
 
@@ -25769,6 +25791,40 @@ async def stream_agent_loop(
                 or (approved.tool_name in {"create_document", "edit_document", "update_document"})
             )
         )
+        # MCP-backed tools (remote servers and OXS in-process extensions)
+        # are outside the hard-coded effectful list above, but a sealed
+        # approval is still a sealed action — the tool already ran once
+        # during the approval replay above and the result is appended to
+        # ``messages``. Letting the loop reach the model normally keeps
+        # the model's prose loop intact (so it can phrase a final answer
+        # based on the tool result), but a small minority of models
+        # re-emit the same MCP call on the very next round and produce a
+        # duplicate ``Tool executed`` log line. To avoid both bugs at
+        # once — "execute twice" and "skip the model and emit
+        # Unsupported execution claims" — we cache the replay result
+        # in a module-level dict that ``src/tool_execution.py`` reads
+        # before dispatching MCP calls. The model still gets its turn
+        # (so it can summarise the result), but a duplicate dispatch is
+        # dropped silently and uses the cached payload.
+        if tool_result_is_successful(approved_result):
+            _APPROVED_MCP_RESULTS[(approved.tool_name, (approved.content or "").strip())] = dict(approved_result)
+            # Also register this exact (tool, args) signature as a successful
+            # mutation in the contract ledger so the next-round
+            # ``_blocked_repeated_successful_mutation`` guard picks it up if
+            # the model re-emits the same MCP call. Without this the guard's
+            # contract-only mutation set never sees MCP approvals and the
+            # model keeps re-issuing the same call into the loop_breaker.
+            try:
+                _approved_block_for_sig = ToolBlock(
+                    approved.tool_name, approved.content or ""
+                )
+                _approved_sig = _contract_mutation_signature(
+                    _approved_block_for_sig, None
+                )
+                if _approved_sig is not None:
+                    _successful_mutation_signatures.add(_approved_sig)
+            except Exception:
+                pass
         if _approved_effectful:
             full_response = "Done."
             # The approval question was streamed on the original request and
