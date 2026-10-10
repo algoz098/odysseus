@@ -11,7 +11,7 @@
   },
   "license": "AGPL-3.0-or-later",
   "repository": "https://github.com/odysseus-dev/odysseus/tree/main/extensions/whats2api_bridge",
-  "description": "WhatsApp via whats2api.com \u2014 list/start/stop sessions, send messages and reactions, and ingest every inbound event (messages.upsert, connection.update, group-participants.update, ...) through an OXS webhook.",
+  "description": "WhatsApp via whats2api.com — list/start/stop sessions, send messages and reactions, and ingest every inbound event (messages.upsert, connection.update, group-participants.update, ...) through an OXS webhook.",
   "entry_point": "plugin:register",
   "hooks": [
     "on_install",
@@ -61,7 +61,7 @@
       "api_token": {
         "type": "string",
         "title": "API token",
-        "description": "Long-lived API token from the whats2api.com dashboard (Dashboard \u2192 API Tokens). Shown only once at creation. 64 hex chars.",
+        "description": "Long-lived API token from the whats2api.com dashboard (Dashboard → API Tokens). Shown only once at creation. 64 hex chars.",
         "minLength": 8,
         "maxLength": 256
       },
@@ -97,6 +97,19 @@
         "title": "Persist every inbound event",
         "default": true,
         "description": "If true, every whats2api event is stored in the events table."
+      },
+      "inbound_webhook_key": {
+        "type": "string",
+        "title": "Inbound webhook key (DEPRECATED — kept for back-compat, no UI exposure)",
+        "description": "Legacy field, no longer read or enforced. Exists only so old settings files load without error.",
+        "maxLength": 256
+      },
+      "webhook_url_token": {
+        "type": "string",
+        "title": "Webhook URL token",
+        "description": "User-defined token that replaces the auto-generated <token> in /api/ext/whats2api_bridge/webhook/<token>. Type any string; only URL-safe characters (A–Z, a–z, 0–9, '-', '_') are accepted because the value goes into the URL path. Persisted to data/extensions/whats2api_bridge/inbound_webhook_token (mode 0600) and survives restarts; takes effect on the dispatcher immediately after save.",
+        "pattern": "^[A-Za-z0-9_-]*$",
+        "maxLength": 1024
       }
     },
     "additionalProperties": false,
@@ -182,7 +195,7 @@
     }
   },
   "file_hashes": {
-    "plugin.py": "sha256:5acfd0d973191572a02095ce8fda42d7f221b0749102aad8c3685424e8c93f47",
-    "ui/index.html": "sha256:92a5675a405a7b5c643341e3fb3cd27a62eab55f5ec94d107f2e2e79a6428795"
+    "plugin.py": "sha256:1749f171bdd817ea43f05fa150c43cb862456b4ec9cfd05ad3a4b4592b426ead",
+    "ui/index.html": "sha256:86adccf59a1c534b2f6b5bbe0f554a4958b0a588c2c86e0e24e027b37e6a598f"
   }
 }

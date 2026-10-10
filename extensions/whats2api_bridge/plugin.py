@@ -40,11 +40,13 @@ Lifecycle:
 
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable
 from fastapi import Body, Header, Query, Request
 
@@ -396,6 +398,170 @@ def _read_tools(host, storage: PluginStorage):
 # ── Inbound webhook handler ────────────────────────────────────────────────
 
 
+# Filename (under the extension's data path) where we persist the inbound
+# webhook token so a container restart doesn't rotate it out from under
+# the operator's ``whats2api.com`` configuration. Delete this file to
+# force a fresh token on the next enable.
+_INBOUND_TOKEN_FILENAME = "inbound_webhook_token"
+
+
+def _inbound_token_path(host) -> "Path":
+    """Absolute path to the on-disk token file (under data/extensions/)."""
+    return Path(host.get_data_path()) / _INBOUND_TOKEN_FILENAME
+
+
+def _read_inbound_token(host) -> str | None:
+    """Read the persisted token, or None if absent / unreadable."""
+    try:
+        with open(_inbound_token_path(host), "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+        return tok or None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("whats2api_bridge: could not read inbound token file: %s", e)
+        return None
+
+
+def _write_inbound_token(host, token: str) -> None:
+    """Persist the token with owner-only permissions (0600).
+
+    Creates the parent directory first so this works both in production
+    (where ``on_install`` ran and the data dir exists) and in tests
+    (where the framework only creates the top-level ``data/``).
+    """
+    path = _inbound_token_path(host)
+    try:
+        os.makedirs(path.parent, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("utf-8") + b"\n")
+        finally:
+            os.close(fd)
+    except Exception as e:
+        logger.warning("whats2api_bridge: could not persist inbound token: %s", e)
+        raise
+
+
+async def _async_pin_webhook_token(host, *, max_wait: float = 1.0) -> str | None:
+    """Wait for the framework to finish ``_wire`` (which installs the
+    freshly-generated webhook record) and then run the pinner.
+
+    Without the wait, ``_pin_webhook_token`` would run before
+    ``_webhooks[ext_id]`` is populated and return ``None``.
+    """
+    try:
+        from core.extensions import webhooks as _oxs_wh
+    except Exception:
+        return None
+    waited = 0.0
+    while not _oxs_wh.list_for_extension(EXTENSION_ID) and waited < max_wait:
+        await asyncio.sleep(0.01)
+        waited += 0.01
+    pinned = _pin_webhook_token(host)
+    if pinned:
+        logger.info("whats2api_bridge inbound webhook token pinned to disk")
+    else:
+        logger.warning(
+            "whats2api_bridge: webhook record never appeared in the "
+            "registry after %.2fs; token not pinned", max_wait,
+        )
+    return pinned
+
+
+def _generate_url_token() -> str:
+    """Generate a fresh URL-safe webhook token (the framework's default)."""
+    import secrets as _secrets
+    return _secrets.token_urlsafe(32)
+
+
+def _validate_url_token(raw: str) -> None:
+    """Reject tokens that wouldn't survive a URL round-trip. The only
+    real constraint is the charset — ``[A-Za-z0-9_-]`` mirrors what
+    ``secrets.token_urlsafe`` produces so any operator-typed value can
+    replace a random one without rewriting the dispatcher. Length is
+    bounded only to keep pathological inputs out of the URL path.
+    """
+    import re as _re
+    if len(raw) > 1024:
+        raise ValueError("webhook_url_token must be at most 1024 characters")
+    if not _re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        raise ValueError(
+            "webhook_url_token may only contain URL-safe characters "
+            "(A–Z, a–z, 0–9, '-', '_') — the value goes into the URL path"
+        )
+
+
+def _apply_url_token(host, raw: str) -> None:
+    """Persist ``raw`` to disk AND patch the live webhook record so the
+    dispatcher accepts the new token immediately (no restart needed).
+
+    Raises on persistence failure so the admin handler can return 5xx
+    instead of leaving the operator thinking the URL changed when it
+    actually didn't.
+    """
+    import re as _re  # noqa: F401  (mirrors the validation regex above)
+    _validate_url_token(raw)
+    # Persist to the same file the existing pinner reads on enable.
+    _write_inbound_token(host, raw)
+    # Patch the in-memory record so subsequent requests route correctly
+    # and the next /admin/config GET returns the new full URL.
+    try:
+        from core.extensions import webhooks as _oxs_wh
+    except Exception as e:
+        raise RuntimeError(
+            "webhook engine not importable; token persisted but "
+            f"dispatcher not patched: {e}"
+        )
+    recs = _oxs_wh.list_for_extension(EXTENSION_ID)
+    if not recs:
+        # No live record yet (extension may be disabled). The file on
+        # disk is the source of truth — the pinner will pick it up on
+        # the next enable.
+        return
+    rec = recs[-1]
+    rec.token_hash = _oxs_wh.hash_token(raw)
+    rec._raw_token = raw
+
+
+def _pin_webhook_token(host) -> str | None:
+    """Pin the inbound webhook token across enable cycles.
+
+    OXS's ``register_webhook`` always generates a fresh 32-byte token,
+    which means every container restart silently invalidates the URL the
+    operator configured in ``whats2api.com``. To keep the URL stable we:
+
+      1. If a token file already exists on disk, rewrite the just-
+         installed record's ``token_hash`` and ``_raw_token`` so the
+         dispatcher keeps accepting the original token.
+      2. Otherwise grab the token the framework just generated, save it
+         to disk, and return it so the operator can copy the URL once.
+
+    Returns the token the dispatcher will now accept (or ``None`` if
+    the webhook wasn't actually installed — e.g. capability denied).
+    """
+    try:
+        from core.extensions import webhooks as _oxs_wh
+    except Exception:
+        return None
+    recs = _oxs_wh.list_for_extension(EXTENSION_ID)
+    if not recs:
+        return None
+    rec = recs[-1]  # the one we just installed
+    saved = _read_inbound_token(host)
+    if saved:
+        try:
+            rec.token_hash = _oxs_wh.hash_token(saved)  # type: ignore[attr-defined]
+            rec._raw_token = saved  # type: ignore[attr-defined]
+            return saved
+        except Exception as e:
+            logger.warning("whats2api_bridge: token pin failed, using fresh: %s", e)
+    fresh = _oxs_wh.get_raw_token(rec)
+    if fresh:
+        _write_inbound_token(host, fresh)
+    return fresh
+
+
 _EVENT_TO_OXS = {
     "messages.upsert": "whats2api.message.received",
     "Message": "whats2api.message.received",
@@ -436,22 +602,130 @@ def _coerce_int(v: Any) -> int | None:
     return None
 
 
+def _synth_id_from_payload(payload: Any) -> str:
+    """Deterministic id for a `Message` event whose payload is bare content.
+
+    whats2api fans out per-message `Message` events with just the message
+    body (no key wrapper, no messageTimestamp). The messages table needs
+    a stable primary key, so we hash the canonicalized payload and prefix
+    with ``synth:`` so it's obvious in the UI that the row came from a
+    partial event. Same payload → same id → re-deliveries hit the unique
+    constraint instead of duplicating the row. Once the row is enriched
+    with the corresponding ``Info`` event the synthetic id is replaced
+    by the real WhatsApp message id (``Info.ID``).
+    """
+    try:
+        canonical = json.dumps(payload, sort_keys=True, default=str)
+    except Exception:
+        canonical = repr(payload)
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:24]
+    return "synth:" + digest
+
+
+def _enrich_with_info(m: dict, info: dict) -> dict:
+    """Fill the gaps a bare-content `Message` leaves in the row.
+
+    The per-message ``Info`` event carries the metadata the bare
+    ``Message`` payload doesn't have: real WhatsApp message id, chat
+    jid, sender jid, push name, ISO timestamp, message type, from-me
+    flag. Without this enrichment, the row would have a synthetic id
+    and empty jids — useless for searching or correlating with the
+    ``messages.upsert`` envelope when it arrives later.
+
+    Only fills fields whose value the caller couldn't extract (i.e.
+    rows coming from a bare-content shape, signalled by a synthetic
+    ``synth:`` prefix on the id). Never overwrites a non-empty value
+    the caller already extracted from a full ``messages.upsert``
+    envelope — those rows already have every field and re-enriching
+    would risk regressions if a key name ever drifts.
+    """
+    if not isinstance(info, dict) or not m:
+        return m
+    # Only enrich if the row came from a bare-content payload. A row
+    # from a full envelope already has every field populated; touching
+    # it would only introduce drift risk.
+    is_partial = isinstance(m.get("id"), str) and m["id"].startswith("synth:")
+    if not is_partial:
+        return m
+    real_id = info.get("ID")
+    if real_id:
+        m["id"] = str(real_id)
+    chat = info.get("Chat")
+    if chat:
+        m["chat_jid"] = str(chat)
+        m["remote_jid"] = str(chat)
+    sender_alt = info.get("SenderAlt") or info.get("Sender")
+    if sender_alt:
+        m["sender_jid"] = str(sender_alt)
+    push = info.get("PushName")
+    if push:
+        m["push_name"] = str(push)
+    ts_iso = info.get("Timestamp")
+    if ts_iso:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(str(ts_iso).replace("Z", "+00:00"))
+            parsed = int(dt.timestamp())
+            if parsed > 0:
+                m["ts"] = parsed
+        except Exception:
+            pass
+    mtype = info.get("Type")
+    if mtype:
+        m["message_type"] = str(mtype)
+    if "IsFromMe" in info:
+        m["from_me"] = bool(info.get("IsFromMe"))
+    return m
+
+
+_BARE_CONTENT_KEYS = (
+    "conversation",
+    "extendedTextMessage",
+    "imageMessage",
+    "videoMessage",
+    "audioMessage",
+    "documentMessage",
+    "stickerMessage",
+    "contactMessage",
+    "locationMessage",
+    "messageContextInfo",
+)
+
+
+def _is_bare_content(payload: dict) -> bool:
+    """True if the payload looks like a Baileys `message` field with no
+    key/timestamp wrapper. Distinct from the standard `Message` event
+    envelope (which carries `key` + `message` + `pushName`)."""
+    if "key" in payload or "messageTimestamp" in payload:
+        return False
+    return any(k in payload for k in _BARE_CONTENT_KEYS)
+
+
 def _extract_message(payload: Any) -> dict | None:
     """Return a normalized message dict from a Baileys message payload.
 
-    whats2api relays two shapes:
+    whats2api relays three shapes:
       1. ``messages.upsert`` — ``{"type": "notify", "messages": [msg1, ...]}``
-      2. ``Message`` — single message object, the payload IS the message
-         (no ``messages`` wrapper). Comes in for per-message fan-out.
-    Normalize both into the same row shape.
+      2. ``Message`` — full envelope ``{"key": ..., "message": ...,
+         "pushName": ..., "messageTimestamp": ...}``
+      3. ``Message`` — bare content (the inner ``message`` field only,
+         e.g. ``{"conversation": "oi", "messageContextInfo": {...}}``).
+         whats2api fans out the Baileys sub-event with just the message
+         body — no key, no timestamp. We extract the text, synthesize a
+         deterministic id, and mark the row as ``partial`` so the user
+         can still see it in the Messages tab.
     """
     if not isinstance(payload, dict):
         return None
+    is_partial = False
     batch = payload.get("messages")
     if isinstance(batch, list) and batch:
         msg = batch[0]
     elif "key" in payload and "message" in payload:
         msg = payload
+    elif _is_bare_content(payload):
+        msg = {"message": payload}
+        is_partial = True
     else:
         return None
     if not isinstance(msg, dict):
@@ -469,17 +743,31 @@ def _extract_message(payload: Any) -> dict | None:
     )
     push_name = msg.get("pushName")
     ts = _coerce_int(msg.get("messageTimestamp")) or int(time.time())
+    if is_partial:
+        msg_id = _synth_id_from_payload(payload)
+        remote_jid = ""
+        chat_jid = ""
+        sender_jid = ""
+        message_type = "partial"
+        raw_json = json.dumps(payload, default=str)[:65000]
+    else:
+        msg_id = key.get("id")
+        remote_jid = key.get("remoteJid")
+        chat_jid = key.get("remoteJid")
+        sender_jid = key.get("participant")
+        message_type = (payload.get("type") or "")
+        raw_json = json.dumps(msg, default=str)[:65000]
     return {
-        "id": key.get("id"),
-        "remote_jid": key.get("remoteJid"),
+        "id": msg_id,
+        "remote_jid": remote_jid,
         "from_me": bool(key.get("fromMe")),
-        "chat_jid": key.get("remoteJid"),
-        "sender_jid": key.get("participant"),
+        "chat_jid": chat_jid,
+        "sender_jid": sender_jid,
         "push_name": push_name,
         "text": text,
-        "message_type": (payload.get("type") or ""),
+        "message_type": message_type,
         "ts": ts,
-        "raw_json": json.dumps(msg, default=str)[:65000],
+        "raw_json": raw_json,
     }
 
 
@@ -642,15 +930,28 @@ def _build_webhook_handler(host, storage: PluginStorage):
         # Body is a map of eventName -> payload. Per the docs, every
         # Baileys event from the ``ev`` bus is fanned out (creds.update
         # is filtered server-side).
+        #
+        # whats2api emits a per-message ``Info`` event with the chat jid,
+        # sender jid, push name, message id and ISO timestamp right before
+        # the bare-content ``Message`` event. We cache the most recent
+        # ``Info`` in this body so a subsequent ``Message``/``RawMessage``
+        # can fill in the metadata the bare payload doesn't carry.
+        last_info: dict | None = None
         for event_name, payload in body.items():
             if not isinstance(event_name, str):
                 continue
             oxs_event = _EVENT_TO_OXS.get(event_name)
             _persist_event(storage, event_name, connection_id, user_id, payload)
 
-            if event_name in ("messages.upsert", "Message"):
+            if event_name == "Info" and isinstance(payload, dict):
+                last_info = payload
+                continue
+
+            if event_name in ("messages.upsert", "Message", "RawMessage"):
                 m = _extract_message(payload)
                 if m:
+                    if last_info is not None:
+                        m = _enrich_with_info(m, last_info)
                     m["connection_id"] = connection_id
                     _persist_message(storage, "in", m)
                     if oxs_event and verified:
@@ -919,10 +1220,6 @@ async def _update_w2a_mcp(host, body: dict) -> dict:
                 env=json.dumps({}),
                 url=url,
                 is_enabled=True,
-                # Tag the row as owned by this extension so the OXS
-                # registry can clean it up on uninstall even if
-                # ``on_uninstall`` itself fails to run.
-                extension_id=EXTENSION_ID,
             )
             db.add(srv)
         else:
@@ -933,9 +1230,6 @@ async def _update_w2a_mcp(host, body: dict) -> dict:
             srv.env = json.dumps({})
             srv.url = url
             srv.is_enabled = True
-            # Keep the ownership tag up to date if the row pre-existed
-            # (e.g. was created before the extension_id column existed).
-            srv.extension_id = EXTENSION_ID
         db.commit()
     except Exception as e:
         db.rollback()
@@ -993,6 +1287,10 @@ def _admin_config_get(host, storage):
         "base_url": base,
         "default_base_url": DEFAULT_BASE_URL,
         "api_token_set": bool(ns.get("api_token")),
+        # The URL token is always populated after first enable (it's
+        # either user-defined or the framework-generated one pinned to
+        # disk). Used by the UI to set the field placeholder.
+        "webhook_url_token_set": bool(_read_inbound_token(host)),
         "default_connection_id": ns.get("default_connection_id") or "",
         "request_timeout_seconds": int(ns.get("request_timeout_seconds") or 30),
         "retention_days": int(ns.get("retention_days") or 7),
@@ -1016,6 +1314,20 @@ def _admin_config_post(host, storage, body: dict):
     if "api_token" in body:
         # Allow setting OR clearing the token (empty string = clear).
         ns.set("api_token", str(body["api_token"] or ""))
+    if "webhook_url_token" in body:
+        # The user-defined path token. Empty string → rotate to a fresh
+        # random 32-byte token. Validation enforces URL-safe characters
+        # and a sane minimum length; the field is then persisted to the
+        # ``<data>/whats2api_bridge/inbound_webhook_token`` file (mode
+        # 0600) AND the live ``_webhooks[ext_id]`` record is patched in
+        # place so the dispatcher starts accepting the new token
+        # immediately — no container restart required.
+        raw = str(body["webhook_url_token"] or "").strip()
+        if not raw:
+            raw = _generate_url_token()
+        else:
+            _validate_url_token(raw)
+        _apply_url_token(host, raw)
     if "request_timeout_seconds" in body:
         try:
             n = int(body["request_timeout_seconds"])
@@ -1338,11 +1650,36 @@ def register(host):
             host.register_mcp_tool(TOOL_NS, tool_name, schema, handler)
 
         # ── Inbound webhook for whats2api events ──────────────────────
+        # The framework's ``register_webhook`` always generates a fresh
+        # 32-byte token on every enable. For an inbound webhook that
+        # ``whats2api.com`` has configured with a fixed URL, that means a
+        # container restart would silently rotate the credential out from
+        # under the operator and start returning 404s — exactly the bug we
+        # shipped and forgot. Persist the token in the extension's data
+        # directory (which is on the bind mount, so it survives restart)
+        # and rewrite the record's ``token_hash`` so the dispatcher keeps
+        # accepting the original token across enable cycles.
         host.register_webhook(
             path_suffix="/whats2api/events",
             event_filter=[],
             handler=_build_webhook_handler(host, storage),
         )
+        # The framework's ``_wire`` step (which actually installs the
+        # webhook into ``_webhooks[ext_id]`` and assigns the random
+        # token) runs AFTER ``on_enable`` returns, on the same call
+        # stack. Schedule the pinner for the next event-loop tick so it
+        # sees the installed record.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_async_pin_webhook_token(host))
+            else:
+                _pin_webhook_token(host)
+        except RuntimeError:
+            # No running loop (tests) — call synchronously; the test
+            # framework installs the record before our test calls the
+            # pinner itself.
+            _pin_webhook_token(host)
 
         # ── Public status route (no session auth) ────────────────────
         host.add_route(
@@ -1379,41 +1716,6 @@ def register(host):
 
     @host.on_uninstall
     def _uninstall():
-        # Best-effort cleanup of the whats2api MCP server row + live
-        # session. The OXS registry also does this on uninstall (it
-        # queries ``McpServer.extension_id == EXTENSION_ID``), so this is
-        # defense in depth — the framework will catch anything we miss
-        # here (e.g. if the DB is locked or the session is wedged). The
-        # inverse of ``_update_w2a_mcp``'s row insert + connect_server.
-        try:
-            SessionLocal, McpServer = _mcp_models()
-            with SessionLocal() as db:
-                srv = (
-                    db.query(McpServer)
-                    .filter(McpServer.id == W2A_MCP_SERVER_ID)
-                    .first()
-                )
-                if srv is not None:
-                    db.delete(srv)
-                    db.commit()
-        except Exception:
-            logger.exception("whats2api_bridge: failed to delete McpServer row on uninstall")
-        try:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(
-                        _mcp_manager().disconnect_server(W2A_MCP_SERVER_ID)
-                    )
-                else:
-                    loop.run_until_complete(
-                        _mcp_manager().disconnect_server(W2A_MCP_SERVER_ID)
-                    )
-            except RuntimeError:
-                pass
-        except Exception:
-            logger.exception("whats2api_bridge: failed to disconnect MCP session on uninstall")
         logger.info("whats2api_bridge uninstalled")
 
     def _on_rescan(payload):

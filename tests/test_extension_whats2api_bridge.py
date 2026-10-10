@@ -648,3 +648,112 @@ def test_extract_message_returns_none_for_unknown_shapes():
     assert _extract_message({}) is None
     assert _extract_message({"messages": []}) is None
     assert _extract_message({"messages": "not-a-list"}) is None
+
+# ── User-defined webhook URL token ─────────────────────────────────────────
+
+
+def test_webhook_url_token_user_can_set_and_url_updates(registry):
+    """Operator can define a custom URL token via the admin endpoint.
+
+    After the save:
+      - the on-disk file holds the new token,
+      - the live ``_webhooks`` record's ``token_hash`` is patched so the
+        dispatcher accepts the new token immediately,
+      - the next ``/admin/config`` GET returns ``webhook_url`` with the
+        new token (no container restart needed),
+      - dispatching an event with the OLD token returns 404 and with
+        the NEW token returns 202.
+    """
+    running = registry.enable("whats2api_bridge")
+    from core.extensions import webhooks as _oxs_wh
+    from extensions.whats2api_bridge.plugin import (
+        _admin_config_get,
+        _admin_config_post,
+        _read_inbound_token,
+    )
+
+    # Capture the framework-generated token so we can prove it was
+    # replaced (not just shadowed).
+    recs = _oxs_wh.list_for_extension("whats2api_bridge")
+    old_token = _oxs_wh.get_raw_token(recs[0])
+    assert old_token, "framework should have generated a token on enable"
+
+    new_token = "operator-chosen-token-1234567890"
+    assert new_token != old_token
+    r = _admin_config_post(running.host, None, {"webhook_url_token": new_token})
+    assert r["ok"] is True
+
+    # 1. File on disk holds the new token.
+    assert _read_inbound_token(running.host) == new_token
+
+    # 2. Live record's token_hash now matches the new token.
+    recs = _oxs_wh.list_for_extension("whats2api_bridge")
+    assert _oxs_wh.verify_token_hash(new_token, recs[0].token_hash)
+    assert _oxs_wh.get_raw_token(recs[0]) == new_token
+    # And the OLD token no longer hashes to the same value.
+    assert not _oxs_wh.verify_token_hash(old_token, recs[0].token_hash)
+
+    # 3. /admin/config surfaces the new URL.
+    cfg = _admin_config_get(running.host, None)
+    assert cfg["webhook_url"].endswith("/" + new_token)
+    assert cfg["webhook_url_token_set"] is True
+
+    # 4. Dispatcher behavior reflects the change.
+    async def dispatch(tok):
+        return await _oxs_wh.dispatch(
+            "whats2api_bridge", tok,
+            b'{}',
+            headers={"whats2api": "true"},
+            query={},
+        )
+    new_status, _ = asyncio.run(dispatch(new_token))
+    old_status, _ = asyncio.run(dispatch(old_token))
+    assert new_status == 202
+    assert old_status == 404
+
+
+def test_webhook_url_token_empty_string_rotates_random(registry):
+    """Sending ``webhook_url_token: ""`` rotates to a fresh 32-byte
+    random token — useful for the UI's "Generate" button."""
+    running = registry.enable("whats2api_bridge")
+    from core.extensions import webhooks as _oxs_wh
+    from extensions.whats2api_bridge.plugin import (
+        _admin_config_post,
+        _read_inbound_token,
+    )
+
+    recs = _oxs_wh.list_for_extension("whats2api_bridge")
+    old_token = _oxs_wh.get_raw_token(recs[0])
+
+    r = _admin_config_post(running.host, None, {"webhook_url_token": ""})
+    assert r["ok"] is True
+
+    new_token = _read_inbound_token(running.host)
+    assert new_token and new_token != old_token
+    # 32 random bytes → base64-url ≈ 43 chars without trailing '='.
+    assert len(new_token) >= 40
+
+
+def test_webhook_url_token_validation_rejects_bad_values(registry):
+    """Non-URL-safe chars and oversized tokens are rejected. Anything
+    else (including very short strings) is accepted."""
+    running = registry.enable("whats2api_bridge")
+    from extensions.whats2api_bridge.plugin import _admin_config_post
+    # Non-URL-safe chars: must raise.
+    for bad in ("abc/def", "abc def", "abc#def", "abc?def"):
+        try:
+            _admin_config_post(running.host, None, {"webhook_url_token": bad})
+        except ValueError as e:
+            assert "URL-safe" in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for token {bad!r}")
+    # Too long: must raise (>1024 chars).
+    try:
+        _admin_config_post(running.host, None, {"webhook_url_token": "a" * 1025})
+    except ValueError as e:
+        assert "1024" in str(e) or "characters" in str(e)
+    else:
+        raise AssertionError("expected ValueError for token >1024 chars")
+    # Arbitrary short strings: must succeed.
+    for ok in ("a", "x", "1", "abc", "token"):
+        _admin_config_post(running.host, None, {"webhook_url_token": ok})

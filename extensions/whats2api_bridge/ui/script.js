@@ -106,6 +106,18 @@
         $("cfg-api_token").value = ""; // never display the existing token
         $("cfg-api_token").placeholder = d.api_token_set ? "(unchanged — type to replace)" : "(not set)";
 
+        // The URL token is the operator's own credential — show it in the
+        // input so they always see what the dispatcher is currently
+        // accepting. The admin endpoint already exposes it via the full
+        // ``webhook_url`` so there's no new surface here.
+        {
+          const urlToken = (d.webhook_url || "").split("/").pop() || "";
+          $("cfg-webhook_url_token").value = urlToken;
+        }
+        $("cfg-webhook_url_token").placeholder = d.webhook_url_token_set
+          ? "type to replace, or click Generate random"
+          : "(auto-generated on first enable)";
+
         // Webhook info
         const kv = $("webhook-info");
         const host = window.location.origin;
@@ -129,6 +141,12 @@
       };
       const tok = $("cfg-api_token").value;
       if (tok) body.api_token = tok; // only send when user typed something
+      // Always send the URL token: empty string in the input means
+      // "rotate to a fresh random one". The current value is always
+      // visible in the field (no "unchanged" placeholder), so the
+      // operator is in full control — re-sending the same value is a
+      // no-op (the dispatcher keeps accepting it).
+      body.webhook_url_token = $("cfg-webhook_url_token").value;
       $("cfg-status").textContent = "saving…";
       try {
         await api("/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -140,6 +158,18 @@
         $("cfg-status").textContent = "";
         showMsg("Save failed: " + e.message, "err");
       }
+    }
+
+    async function rotateWebhookToken() {
+      // Generate a fresh random 32-byte URL-safe token client-side and
+      // stage it in the field. The actual save hits POST /config which
+      // writes to the pinned file AND patches the live dispatcher.
+      const buf = new Uint8Array(32);
+      crypto.getRandomValues(buf);
+      const tok = btoa(String.fromCharCode(...buf))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      $("cfg-webhook_url_token").value = tok;
+      showMsg("Generated a fresh 32-byte token. Click Save to apply.", "ok");
     }
 
     // ── Webhook copy ─────────────────────────────────────────────────
@@ -302,6 +332,7 @@
       const t = $("cfg-api_token");
       t.type = t.type === "password" ? "text" : "password";
     });
+    $("cfg-rotate-url-token").addEventListener("click", rotateWebhookToken);
     document.querySelectorAll(".tab-btn").forEach(b => {
       b.addEventListener("click", () => { browser.tab = b.dataset.tab; browser.offset = 0; refreshBrowser(); });
     });
