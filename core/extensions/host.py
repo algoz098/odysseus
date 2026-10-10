@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -184,20 +185,70 @@ class TaskActionRegistration:
 class SettingsNamespace:
     """Per-extension settings, scoped to ``oxs.extensions.<id>.*``.
 
-    Backed by ``data/oxs/permissions/<id>.json`` (PR 3 will read/write
-    there) plus an in-memory cache for the running session. PR 2 only
-    implements in-memory; the on-disk persistence is a PR 3 concern.
+    Backed by ``data/oxs/permissions/<id>.json`` plus an in-memory cache
+    for the running session. Every ``set()`` is persisted synchronously
+    so a container restart does not silently wipe operator-entered
+    values like ``api_token`` (whats2api_bridge) — that bug surfaced
+    after the auto-restore fix: handlers came back online but every
+    token/key the operator had typed in the UI was gone, so calls
+    returned ``api_token is not configured`` on every restart.
     """
 
     def __init__(self, extension_id: str):
         self.extension_id = extension_id
         self._values: dict[str, Any] = {}
+        self._load_from_disk()
+
+    @property
+    def _path(self) -> str:
+        # Lazy import to avoid a hard cycle with core.extensions.__init__
+        # pulling in src.constants before it's fully resolved.
+        from src.constants import OXS_PERMISSIONS_DIR
+        return os.path.join(OXS_PERMISSIONS_DIR, f"{self.extension_id}.json")
+
+    def _load_from_disk(self) -> None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            # A corrupt file shouldn't break enable(); the in-memory
+            # values from on_enable's _ensure_settings seed the
+            # namespace again, so the next set() overwrites the bad file.
+            import logging
+            logging.getLogger(__name__).warning(
+                "OXS settings load skipped for %s: %s",
+                self.extension_id, exc,
+            )
+            return
+        if isinstance(data, dict):
+            self._values.update(data)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._values.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
         self._values[key] = value
+        self._persist()
+
+    def _persist(self) -> None:
+        try:
+            from src.constants import OXS_PERMISSIONS_DIR
+            os.makedirs(OXS_PERMISSIONS_DIR, exist_ok=True)
+            tmp_path = self._path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._values, f, sort_keys=True)
+            os.replace(tmp_path, self._path)
+        except OSError as exc:
+            # Persistence is best-effort; an unwritable volume shouldn't
+            # bring down the request. The in-memory value still applies
+            # for this process; a future set() will retry the write.
+            import logging
+            logging.getLogger(__name__).warning(
+                "OXS settings persist failed for %s: %s",
+                self.extension_id, exc,
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self._values)
