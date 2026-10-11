@@ -143,16 +143,23 @@ class ExtensionRegistry:
         # in the same startup pass.
         self.rescan()
 
-        try:
-            from core.database import SessionLocal, Extension as _ExtRow
-            with SessionLocal() as db:
-                rows = db.query(_ExtRow).filter(_ExtRow.is_enabled == True).all()
-                ids = [r.id for r in rows]
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "OXS restore_enabled_state: extension table read failed"
+        ids = self._read_persisted_enabled_ids()
+        if ids is None:
+            # The persisted ``extensions`` table is unreadable (typically
+            # SQLite ``database disk image is malformed`` after a hard
+            # crash). Falling back to "enable every discovered extension"
+            # is the right safe default for OXS — operators install to
+            # enable, and only the persisted ``is_enabled=false`` rows
+            # represent explicit opt-outs we cannot read. A loud log makes
+            # the fallback visible so operators can re-disable an
+            # extension they intended off.
+            logging.getLogger(__name__).warning(
+                "OXS restore_enabled_state: could not read extensions "
+                "table; falling back to enable-everything for the %d "
+                "discovered extension(s)",
+                len(self._extensions),
             )
-            return []
+            ids = list(self._extensions.keys())
 
         restored: list[str] = []
         for ext_id in ids:
@@ -169,13 +176,180 @@ class ExtensionRegistry:
                 restored.append(ext_id)
             except Exception:
                 logging.getLogger(__name__).exception(
-                    "OXS auto-enable failed for %s", ext_id
+                    "OXS auto-enable failed for %s", ext_id,
                 )
         if restored:
             logging.getLogger(__name__).info(
-                "OXS auto-restored enabled extensions: %s", restored
+                "OXS auto-restored enabled extensions: %s", restored,
             )
+        # Finding 7 follow-up: a container restart can also happen between
+        # an extension's enable and the McpManager settling in, leaving
+        # ``_in_process_tools`` empty for an extension that ``running.enabled``
+        # already records as active. Walk every registered extension (not just
+        # the ones we just enabled in this pass) and reinstall their MCP
+        # tools when the McpManager cache is missing them.
+        self._reinstall_orphan_mcp_tools()
         return restored
+
+    def _read_persisted_enabled_ids(self) -> list[str] | None:
+        """Return the list of extension ids marked ``is_enabled=true``.
+
+        Returns ``None`` when the persisted ``extensions`` table is
+        unreadable. Tries the SQLAlchemy ORM first, then falls back to a
+        raw text query so a partial SQLite corruption (e.g. an index
+        issue that lets ``SELECT COUNT(*)`` work but breaks the ORM's
+        full table scan) still surfaces the enabled rows instead of
+        dropping every extension to "disabled".
+
+        When the table is partly readable (enabled list came back) we
+        also try to fetch the explicit disable list so a corrupt index
+        on the boolean column doesn't quietly re-enable an extension
+        the operator previously turned off.
+
+        An empty table (no rows, or all rows are is_enabled=false) is
+        treated like an unreadable table for fallback purposes: the
+        caller will enable every discovered extension. This matches
+        the operator's first-install mental model — they installed
+        the extension, they want it on. A persisted ``is_enabled=false``
+        row still wins because the disabled list comes back populated.
+        """
+        enabled: list[str] | None = None
+        disabled: set[str] = set()
+        try:
+            from core.database import SessionLocal, Extension as _ExtRow
+            with SessionLocal() as db:
+                rows = db.query(_ExtRow).filter(_ExtRow.is_enabled == True).all()
+                enabled = [r.id for r in rows]
+                rows = db.query(_ExtRow).filter(_ExtRow.is_enabled == False).all()
+                disabled = {r.id for r in rows}
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "OXS _read_persisted_enabled_ids: ORM query failed; "
+                "trying raw text fallback"
+            )
+
+        if enabled is None:
+            # ORM failed; try the raw fallback. Surface only the
+            # enabled set — the disabled list is best-effort and we
+            # already treat a missing disabled list as empty.
+            try:
+                from core.database import engine
+                from sqlalchemy import text
+                with engine.connect() as conn:
+                    rows = conn.execute(
+                        text("SELECT id FROM extensions WHERE is_enabled = 1")
+                    ).fetchall()
+                    enabled = [r[0] for r in rows]
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "OXS _read_persisted_enabled_ids: all reads failed"
+                )
+                return None
+
+        # Treat a fully-empty table as "no persisted state" — return
+        # None so the caller falls back to enable-everything. A table
+        # with an explicit disabled row keeps returning the (filtered)
+        # enabled list, so operator opt-outs still win.
+        if not enabled and not disabled:
+            return None
+
+        return [ext_id for ext_id in enabled if ext_id not in disabled]
+
+    def _reinstall_orphan_mcp_tools(self) -> int:
+        """Reinstall OXS in-process MCP tools when the McpManager cache is empty.
+
+        A ``docker compose restart`` clears the Python in-memory state
+        (``McpManager._in_process_tools``) but the persisted
+        ``extensions.is_enabled`` row survives. The normal
+        ``restore_enabled_state`` short-circuits when ``running.enabled`` is
+        already True (no fresh ``enable()`` call), so the in-process tool
+        cache can stay empty for hours until a foreground operator re-enables
+        the extension manually. This method checks the McpManager for the
+        OXS server id of every registered extension with ``host.mcp_tools``
+        and re-runs ``install_tools`` when the cache is missing or empty.
+
+        Idempotent — ``McpManager.register_in_process_tool`` overwrites the
+        existing entry. Returns the number of tools reinstalled.
+        """
+        try:
+            from src.mcp_manager import get_mcp_manager
+            mgr = get_mcp_manager()
+        except Exception:
+            return 0
+        from . import mcp_bridge
+
+        reinstalled = 0
+        for ext_id, running in self._extensions.items():
+            host = running.host
+            if not (running.enabled and host and host.mcp_tools):
+                continue
+            server_id = mcp_bridge._server_id(ext_id)
+            cached = mgr._in_process_tools.get(server_id) or {}
+            expected = {reg.tool_name for reg in host.mcp_tools}
+            if cached.keys() == expected:
+                continue
+            # Either no in-process entries, or the cached set no longer
+            # matches the extension's current MCP tool manifest. Reinstall.
+            try:
+                mcp_bridge.install_tools(ext_id, list(host.mcp_tools))
+                reinstalled += len(expected)
+                logging.getLogger(__name__).info(
+                    "OXS re-installed MCP tools for %s (server_id=%s, expected=%d, cached=%d)",
+                    ext_id, server_id, len(expected), len(cached),
+                )
+                audit_log(
+                    "extension.mcp_tools.reinstalled",
+                    extension_id=ext_id,
+                    actor="system",
+                    payload={"server_id": server_id, "count": len(expected)},
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "OXS re-install mcp tool %s failed", ext_id,
+                )
+        return reinstalled
+
+    def install_oxs_in_process_heal_hook(self) -> None:
+        """Install ``self._reinstall_orphan_mcp_tools`` as the McpManager
+        lazy self-heal hook.
+
+        The hook is called from
+        :meth:`src.mcp_manager.McpManager.get_all_openai_schemas` — every
+        public schema request. A McpManager cache wipe that bypassed
+        the startup auto-restore (manual disconnect, race during
+        re-enable, OXS in-place upgrade) is therefore repaired on the
+        next ``agent_loop`` query rather than leaving the LLM with
+        ``selected_not_offered`` populated for the rest of the
+        process lifetime.
+
+        Idempotent — the hook is a no-op when the cache matches the
+        OXS manifest. Safe to install at startup, before any LLM turn
+        has run.
+        """
+        try:
+            from src.mcp_manager import get_mcp_manager
+            mgr = get_mcp_manager()
+            mgr.set_oxs_in_process_heal_hook(self._reinstall_orphan_mcp_tools)
+            logging.getLogger(__name__).debug(
+                "OXS in-process self-heal hook installed on McpManager"
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "OXS could not install self-heal hook on McpManager"
+            )
+
+    def _reinstall_in_process_mcp_tools(self, running: "RunningExtension") -> None:
+        """Reinstall one running extension's MCP tools into the McpManager.
+
+        Called from :meth:`enable` when the running extension is already
+        flagged ``enabled`` but the McpManager's in-process cache for its
+        server id is empty — the typical post-restart race described in
+        Finding 7. Delegates to :meth:`_reinstall_orphan_mcp_tools` to keep
+        the single source of truth for the install path.
+        """
+        if not running.host.mcp_tools:
+            return
+        self._reinstall_orphan_mcp_tools()
 
     def _register_discovered(self, ext: DiscoveredExtension) -> None:
         """Add a discovered extension to the in-memory registry (not enabled)."""
@@ -459,6 +633,17 @@ class ExtensionRegistry:
         if running is None:
             raise KeyError(f"extension not found: {extension_id!r}")
         if running.enabled:
+            # Defense in depth for Finding 7: a process restart drops the
+            # McpManager._in_process_tools cache while the OXS registry's
+            # in-memory ``running.enabled`` flag survives in memory but the
+            # McpManager state can be reset independently (race with a
+            # container restart, manual disconnect, etc.). Re-run the MCP
+            # ``install_tools`` step when the cache is missing the server's
+            # tools, so a chat that re-enters after a restart always sees
+            # the same OXS surface as the first one. Idempotent —
+            # ``register_in_process_tool`` overwrites the existing entry.
+            if running.host.mcp_tools:
+                self._reinstall_in_process_mcp_tools(running)
             return running
 
         # Apply data_schema (create tables, indexes, uniques) BEFORE

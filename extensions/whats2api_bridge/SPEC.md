@@ -127,7 +127,15 @@ The extension installs a single webhook at:
 POST /api/ext/whats2api_bridge/webhook/<token>
 ```
 
-- `<token>` is a 32-byte URL-safe token generated at install/enable.
+- `<token>` is a 32-byte URL-safe token. OXS's
+  ``host.register_webhook`` generates a fresh one on every enable, which
+  would silently invalidate the URL the operator configured in
+  ``whats2api.com`` on the first container restart. To keep the URL
+  stable, the bridge pins the token to disk at
+  ``<data>/whats2api_bridge/inbound_webhook_token`` (mode ``0600``)
+  on every enable and rewrites the just-installed record's ``token_hash``
+  to match — so a restart loads the same token from disk instead of
+  rolling a new one. Delete the file (and re-enable) to force rotation.
   Shown **once** in the admin UI.
 - The optional header `X-whats2api_bridge-Signature: sha256=<hmac>` is
   verified against a per-extension HMAC secret (constant-time).
@@ -153,6 +161,23 @@ The handler iterates over every event in the body, persists it to
 `whats2api_bridge__events`, and fires the mapped OXS event.
 
 ### 5.3 Event taxonomy
+
+whats2api fans out every Baileys event from the `ev` bus. The handler
+recognises three payload shapes for message-class events:
+
+1. `messages.upsert` → `{type, messages: [...]}` — full envelope per
+   message, `key.id` becomes the messages-table primary key.
+2. `Message` → full envelope `{key, message, pushName,
+   messageTimestamp}` — same as above.
+3. `Message` → **bare content** `{conversation, messageContextInfo,
+   ...}` (no `key`, no `messageTimestamp`). The handler synthesises a
+   deterministic id (``synth:<sha1[:24]>``) and writes a row with
+   `message_type = "partial"`. If a per-message `Info` event arrives in
+   the same body (whats2api always emits it right before the bare
+   `Message`), the row is enriched with the real id, chat jid, sender
+   jid, push name, ISO timestamp and message type — the synthetic id
+   and `partial` marker are replaced and the row is indistinguishable
+   from one written via `messages.upsert`.
 
 | whats2api event             | OXS event                          | Payload                                                                                     |
 | --------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -204,12 +229,17 @@ Tables (created on enable via `storage.apply_data_schema`):
   - indexes on `(status)`, `(owner_id)`
 
 - `whats2api_bridge__messages`
-  - `id TEXT PRIMARY KEY` (WhatsApp message id, dedupes on retry)
+  - `id TEXT PRIMARY KEY` (WhatsApp message id, dedupes on retry; rows
+    from per-message fan-out events that arrive without a `key` get a
+    synthetic id of the form ``synth:<sha1[:24]>`` so re-deliveries hit
+    the unique constraint instead of duplicating)
   - `connection_id TEXT NOT NULL`
   - `direction TEXT NOT NULL` (`in` / `out`)
-  - `remote_jid, chat_jid, sender_jid, push_name TEXT`
+  - `remote_jid, chat_jid, sender_jid, push_name TEXT` (empty for partial
+    rows from bare-content `Message` fan-outs — we have no envelope)
   - `from_me TEXT` (`"0"` / `"1"`)
-  - `text, message_type TEXT`
+  - `text, message_type TEXT` (`message_type` is `"partial"` for rows
+    derived from a bare-content `Message` event)
   - `ts INTEGER NOT NULL`
   - `raw_json TEXT`
   - indexes on `(connection_id, ts)`, `(chat_jid, ts)`, `(direction)`
@@ -228,8 +258,14 @@ scoped to the `whats2api_bridge__` prefix (OXS storage wall).
 
 ## 7. Operational notes
 
-- **Token rotation**: edit `api_token` in settings, disable+enable the
-  extension. The webhook URL/token are regenerated on each enable.
+- **Token rotation**: the inbound webhook token is pinned to disk at
+  ``<data>/whats2api_bridge/inbound_webhook_token`` and survives restarts.
+  To rotate (e.g. suspected compromise): delete the file, disable+enable
+  the extension. The next request will be served under the new token —
+  update ``whats2api.com`` accordingly.
+- **Outbound API token rotation**: edit `api_token` in settings,
+  disable+enable the extension. The webhook URL/token is NOT affected
+  by this (separate credential).
 - **Pruning**: not shipped in v0.1. The `events` table grows linearly
   with incoming traffic; v0.2 should add a TTL job keyed on
   `retention_days`.

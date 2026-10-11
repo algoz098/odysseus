@@ -186,6 +186,15 @@ class McpManager:
         self._in_process_tools: Dict[str, Dict[str, Callable]] = {}
         # Tracking updates to tools/connections for RAG indexing / prompt cache
         self._generation = 0
+        # OXS in-process tool self-heal hook. Set by
+        # :func:`core.extensions.registry.set_oxs_reinstall_hook` at
+        # startup. When set, every :meth:`get_all_openai_schemas` call
+        # invokes the hook so a McpManager cache wipe that bypassed
+        # the startup auto-restore (manual disconnect, race during
+        # re-enable, OXS extension in-place upgrade) is repaired on
+        # the next agent turn. The hook itself is a no-op when the
+        # cache already matches the OXS manifest.
+        self._oxs_in_process_heal_hook: Optional[Callable[[], None]] = None
         # Identity of the actual connection, not a PID or lifecycle contract.
         self._resource_connections = {}
         self._resource_endpoints = {}
@@ -197,6 +206,37 @@ class McpManager:
         global _singleton
         if _singleton is None:
             _singleton = self
+
+    def set_oxs_in_process_heal_hook(self, hook: "Callable[[], None] | None") -> None:
+        """Install (or clear) the OXS in-process tool self-heal hook.
+
+        Called by ``core.extensions.registry.set_oxs_reinstall_hook``
+        during app startup. ``hook`` is invoked from
+        :meth:`get_all_openai_schemas` to repair a McpManager cache
+        that no longer matches the OXS manifest. The hook is expected
+        to be idempotent — it's called on every public schema query,
+        not just after a wipe.
+        """
+        self._oxs_in_process_heal_hook = hook
+
+    def _ensure_oxs_in_process_tools(self) -> None:
+        """Run the OXS self-heal hook, if installed.
+
+        Safe to call on every public schema request: the hook itself
+        is a no-op when the cache matches the OXS manifest, and any
+        exception it raises is caught and logged so a broken hook can
+        never break schema generation.
+        """
+        hook = self._oxs_in_process_heal_hook
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            logger.exception(
+                "McpManager OXS in-process self-heal hook raised; "
+                "schema list may be incomplete until next call"
+            )
 
     async def connect_server(
         self,
@@ -534,12 +574,22 @@ class McpManager:
         input_schema: Dict,
         description: str,
         handler: Callable,
+        read_only: bool = False,
     ) -> None:
         """Register one tool under a namespaced server.
 
         ``handler`` is ``async def handler(arguments: dict) -> Any`` (or sync).
         ``input_schema`` is the JSON Schema the LLM sees. ``description``
         is what shows up next to the tool name in the function-calling UI.
+
+        ``read_only=True`` declares the tool to
+        :mod:`src.tool_capabilities` as a brokered private read. That keeps
+        the post-external-context approval gate from refusing the call as
+        "unknown/high-impact" — which is exactly what happens to OXS
+        extension tools, whose own catalog is injected as untrusted context
+        and therefore arms the gate before the first call. Results are still
+        treated as untrusted external data. The default (``False``) leaves
+        the tool unclassified so the gate keeps failing high.
 
         Also seals a stable resource identity for the server (endpoint,
         incarnation, owner) so the approval gate's
@@ -549,6 +599,7 @@ class McpManager:
         even though ``call_tool`` would happily dispatch them.
         """
         from src.agent_runtime.remote_resources import configuration_incarnation
+        from src.tool_capabilities import declare_mcp_tool_capabilities
         from uuid import uuid4
         if server_id not in self._in_process_tools:
             self._in_process_tools[server_id] = {}
@@ -567,6 +618,12 @@ class McpManager:
             "description": description,
             "handler": handler,
         }
+        # Publish the declared effect class so the approval gate can admit
+        # this tool instead of refusing it as unknown. Undeclared tools stay
+        # unknown (fail high), which is the safe default.
+        declare_mcp_tool_capabilities(
+            f"mcp__{server_id}__{tool_name}", read_only=read_only,
+        )
         # Seal resource identity for the approval gate. Idempotent across
         # re-registrations of the same server: only the *first* tool of a
         # server seals the endpoint tuple so re-registration does not
@@ -602,6 +659,16 @@ class McpManager:
         """Remove every tool belonging to ``server_id``. Returns count."""
         removed = len(self._in_process_tools.get(server_id, {}))
         self._in_process_tools.pop(server_id, None)
+        # Drop the capability declarations for this server's tools so a
+        # later install cannot inherit a stale "read_only" classification.
+        try:
+            from src.tool_capabilities import undeclare_mcp_server_capabilities
+            undeclare_mcp_server_capabilities(server_id)
+        except Exception:
+            logger.debug(
+                "Could not undeclare MCP capabilities for %s", server_id,
+                exc_info=True,
+            )
         # Tear down the resource identity sealed at install time so a
         # re-enable re-seals with a fresh uuid and stale approvals cannot
         # be replayed against the same address.
@@ -855,7 +922,17 @@ class McpManager:
 
         Tool names are namespaced as mcp__{server_id}__{tool_name}.
         disabled_map: optional {server_id: set_of_disabled_tool_names} to filter out.
+
+        Before building the schema list, runs the OXS in-process tool
+        self-heal hook (when registered). This is the catch-all defense
+        for the Finding-7 follow-up: a McpManager cache wipe that
+        bypassed the startup auto-restore is repaired lazily on the
+        next ``agent_loop`` query instead of leaving the LLM with a
+        ``selected_not_offered`` for the rest of the process lifetime.
+        The hook is a no-op when the cache already matches the OXS
+        manifest, so it costs nothing on the happy path.
         """
+        self._ensure_oxs_in_process_tools()
         schemas = []
         # Server ids whose schemas live in ``_in_process_tools`` are also
         # mirrored into ``_tools`` (so ``resource_identity`` can resolve them

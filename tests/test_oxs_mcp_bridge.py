@@ -146,6 +146,64 @@ def test_uninstall_unknown_returns_zero():
     assert n == 0
 
 
+def test_install_tools_prefers_description_rich_for_rag():
+    from src.mcp_manager import get_mcp_manager as McpManager
+    from core.extensions.host import MCPToolRegistration
+
+    semantic = (
+        "List recent WhatsApp messages exchanged with the operator's "
+        "contacts over the configured bridge."
+    )
+
+    reg = MCPToolRegistration(
+        server_name="w2a",
+        tool_name="list_messages",
+        schema={"type": "object"},
+        handler=lambda a: "ok",
+        description_rich=semantic,
+    )
+    mcp_bridge.install_tools("whats2api_bridge", [reg])
+    m = McpManager()
+    stored = m._in_process_tools["oxs_whats2api_bridge"]["list_messages"]
+    assert stored["description"] == semantic
+
+
+def test_install_tools_falls_back_to_legacy_id_placeholder():
+    from src.mcp_manager import get_mcp_manager as McpManager
+    from core.extensions.host import MCPToolRegistration
+
+    reg = MCPToolRegistration(
+        server_name="w2a",
+        tool_name="legacy",
+        schema={"type": "object"},
+        handler=lambda a: "ok",
+    )
+    mcp_bridge.install_tools("bridge", [reg])
+    m = McpManager()
+    stored = m._in_process_tools["oxs_bridge"]["legacy"]
+    assert stored["description"] == "[bridge] legacy"
+
+
+def test_register_mcp_tool_accepts_description_rich():
+    from core.extensions.host import OXSHost
+    host = OXSHost(
+        extension_id="myext",
+        extension_version="1.0",
+        declared_capabilities={"mcp_tools": True},
+        data_path="/tmp/myext-data",
+        plugin_path="/tmp/myext-plugin",
+    )
+    host.register_mcp_tool(
+        server_name="s",
+        tool_name="list_messages",
+        schema={"type": "object"},
+        handler=lambda a: "ok",
+        description_rich="List recent WhatsApp messages between operator contacts.",
+    )
+    reg = host.mcp_tools[0]
+    assert reg.description_rich.startswith("List recent WhatsApp")
+
+
 def test_openai_schema_lists_in_process_tools():
     from src.mcp_manager import get_mcp_manager as McpManager
     from core.extensions.host import MCPToolRegistration

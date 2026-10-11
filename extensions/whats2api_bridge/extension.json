@@ -1,7 +1,7 @@
 {
   "id": "whats2api_bridge",
   "name": "Whats2API Bridge",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "oxs_version": ">=1.0.0,<2.0.0",
   "python_deps": [],
   "author": {
@@ -110,6 +110,54 @@
         "description": "User-defined token that replaces the auto-generated <token> in /api/ext/whats2api_bridge/webhook/<token>. Type any string; only URL-safe characters (A–Z, a–z, 0–9, '-', '_') are accepted because the value goes into the URL path. Persisted to data/extensions/whats2api_bridge/inbound_webhook_token (mode 0600) and survives restarts; takes effect on the dispatcher immediately after save.",
         "pattern": "^[A-Za-z0-9_-]*$",
         "maxLength": 1024
+      },
+      "analyzer_enabled": {
+        "type": "boolean",
+        "title": "Conversation Analyzer — enable",
+        "default": false,
+        "description": "When true, a periodic scheduled task runs in the background, reads recent WhatsApp conversations, and produces a chat-session summary the operator can review (manage_notes / manage_tasks / manage_calendar). WhatsApp write tools are blocked — the agent never replies for you."
+      },
+      "analyzer_interval_minutes": {
+        "type": "integer",
+        "title": "Conversation Analyzer — interval (minutes)",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 720,
+        "description": "How often the analyzer runs while enabled. 30 is a sane default; lower values hit the LLM more often."
+      },
+      "analyzer_lookback_hours": {
+        "type": "integer",
+        "title": "Conversation Analyzer — lookback (hours)",
+        "default": 24,
+        "minimum": 1,
+        "maximum": 168,
+        "description": "Time window the analyzer inspects on each run. 24 = past day."
+      },
+      "analyzer_min_messages": {
+        "type": "integer",
+        "title": "Conversation Analyzer — min messages per chat",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 50,
+        "description": "Skip chats with fewer than N messages in the lookback window. Cuts noise."
+      },
+      "analyzer_endpoint_id": {
+        "type": "string",
+        "title": "Conversation Analyzer — endpoint ID",
+        "description": "Model endpoint to use (e.g. 'default', an OpenAI endpoint, a local Ollama). Empty = use the default endpoint configured in Settings → Models.",
+        "maxLength": 128
+      },
+      "analyzer_model": {
+        "type": "string",
+        "title": "Conversation Analyzer — model",
+        "description": "Model name on the chosen endpoint. Empty = endpoint default.",
+        "maxLength": 256
+      },
+      "analyzer_prompt": {
+        "type": "string",
+        "title": "Conversation Analyzer — system prompt",
+        "description": "Custom instructions for the analyzer. The placeholder {lookback_hours} is replaced with the configured lookback. Leave default for sane behavior.",
+        "maxLength": 8192
       }
     },
     "additionalProperties": false,
@@ -195,7 +243,7 @@
     }
   },
   "file_hashes": {
-    "plugin.py": "sha256:1749f171bdd817ea43f05fa150c43cb862456b4ec9cfd05ad3a4b4592b426ead",
-    "ui/index.html": "sha256:86adccf59a1c534b2f6b5bbe0f554a4958b0a588c2c86e0e24e027b37e6a598f"
+    "plugin.py": "sha256:8a9c2fd7c2ba5357fa45f98d5e5e98927d85d24e28e17bf5ce43621aae0a7167",
+    "ui/index.html": "sha256:1e7e72d980788c5b3fb1e953c95c0ee9fe1c20634578ba43d0b654f72f81d42a"
   }
 }

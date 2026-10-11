@@ -1053,9 +1053,25 @@ def selected_tools_for_request(message: str) -> frozenset[str] | None:
         if re.search(r"\b(?:preview|render|open)\b[^.\n]{0,100}\b(?:page|html|browser)\b", raw_text, re.I):
             tools.add("private_browser")
         return frozenset(tools)
+    # Literal tool names a request may pin. Widening this beyond the original
+    # three must stay conservative: each entry is a personal-data product that
+    # ``requested_capabilities`` also recognizes by noun, so naming one here
+    # never widens scope past a family the request already matched. It only
+    # stops the narrowing step in ``create_request_authority`` from discarding
+    # a matched family whose tool the request named but this tuple omitted —
+    # which is how an OXS analyzer prompt that names ``manage_memory`` lost its
+    # memory writes to ``request_authority_denied``.
+    #
+    # ``search_chats`` must stay in the tuple for the same reason: it shares
+    # the ``memory`` family with ``manage_memory``, so a request naming both
+    # lost ``search_chats`` to narrowing even though it named it literally.
+    _NARROWABLE_TOOL_VOCABULARY = (
+        "manage_notes", "manage_calendar", "manage_tasks", "manage_memory",
+        "search_chats",
+    )
     explicitly_named = {
         name
-        for name in ("manage_notes", "manage_calendar", "manage_tasks")
+        for name in _NARROWABLE_TOOL_VOCABULARY
         if re.search(
             rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
             raw_text,
@@ -4798,10 +4814,17 @@ def requested_capabilities(message: str, history: Iterable = (), *, active_docum
     # The user named the messaging integration; grant the family. This
     # also covers explicit tool-name requests (mcp__whats2api__*) and
     # informal pt-BR phrasings ("manda um whats").
+    #
+    # Additive, not exclusive: an OXS scheduled-task prompt routinely names
+    # the bridge AND the personal products it must persist into ("read
+    # WhatsApp, then save notes/tasks/memory"). Returning only {"messaging"}
+    # used to strip those, so ``create_request_authority`` granted no write
+    # tool at all and every persistence call came back
+    # ``request_authority_denied``. The previously-matched families are kept.
     if "messaging" in newly_named_families or re.search(
         r"\bmcp__(?:oxs_)?whats2api(?:_bridge)?__\w+\b", text, re.I,
     ):
-        return frozenset({"messaging"})
+        return frozenset({"messaging"}) | newly_named_families
     established_family = immediately_established_family(text, history)
     if established_family and not newly_named_families:
         return frozenset({established_family})

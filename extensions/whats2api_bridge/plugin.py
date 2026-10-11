@@ -72,6 +72,133 @@ EXTENSION_ID = "whats2api_bridge"
 TOOL_NS = "oxs_whats2api_bridge"  # unique namespace; "whats2api" collides with the remote MCP server
 DEFAULT_BASE_URL = "https://api.whats2api.com"
 
+# ── Conversation Analyzer (periodic) ─────────────────────────────────────
+# Runs as a ScheduledTask owned by this extension. The scheduler creates a
+# dedicated Session in folder="Tasks" so the operator can review each run
+# as a normal chat — same UX as any other scheduled task. A dedicated
+# CrewMember enforces the "no WhatsApp writes" rule via enabled_tools
+# allowlist.
+ANALYZER_TASK_NAME = "[whats2api_bridge] Conversation Analyzer"
+ANALYZER_CREW_NAME = "WhatsApp Conversation Analyzer"
+ANALYZER_CREW_ICON = "🛰️"
+
+# Tools the analyzer may call. Everything else — including ALL whats2api /
+# whats2api_bridge WRITE tools (send_message, send_reaction, send_media,
+# mark_read, send_presence, call_method, ...) — is filtered out by the
+# scheduler's disabled_tools derivation in _execute_llm_task.
+ANALYZER_ALLOWED_TOOLS: tuple[str, ...] = (
+    # Build-in / native tools (unqualified names — these are the keys in
+    # ``src.tool_index.BUILTIN_TOOL_DESCRIPTIONS``, which the scheduler
+    # uses to derive ``disabled_tools`` from the inverse of this
+    # allowlist. Only names that actually live in that dict will
+    # meaningfully *unblock* a tool; non-matching names like MCP
+    # qualified ones are simply ignored by that filter and stay
+    # available via the agent's normal MCP tool surface).
+    # Read tools (cross-conversation context):
+    "search_chats",
+    # Durable annotations — actions the operator explicitly approved:
+    "manage_notes",
+    "manage_tasks",
+    "manage_calendar",
+    "manage_memory",
+    # Planning / scratchpad:
+    "todowrite",
+    # Local cache of the bridge — accessed via the qualified MCP
+    # names. Listed here for documentation; the scheduler's
+    # ``disabled_tools`` filter does not key on these. They get
+    # registered in the MCP server's namespace and the RAG picks
+    # them up when relevant to the analyzer's prompt.
+    "mcp__oxs_whats2api_bridge__list_messages",
+    "mcp__oxs_whats2api_bridge__get_message",
+    "mcp__oxs_whats2api_bridge__list_events",
+    "mcp__oxs_whats2api_bridge__list_connections_local",
+)
+
+# Tools that the analyzer must NEVER call. Stated as a negative list
+# so a future change to ``ANALYZER_ALLOWED_TOOLS`` cannot accidentally
+# re-introduce a WhatsApp write tool. The runtime gate that enforces
+# this is the bidirectional check performed after the scheduler's
+# own ``disabled_tools`` derivation: anything starting with the
+# prefixes below is rejected with HTTP 409 by the OXS tool dispatcher
+# when the analyzer's loop tries to call it.
+ANALYZER_FORBIDDEN_PATTERNS: tuple[str, ...] = (
+    # Native write surface:
+    "send_message", "send_reaction", "send_media", "send_presence",
+    "mark_read", "call_method", "send_to_session",
+    # Shell / filesystem write surface:
+    "write_file", "edit_file", "apply_patch",
+    "bash", "host_shell", "python",
+    # OAuth / external shells:
+    "set_setting", "manage_settings",
+)
+
+DEFAULT_ANALYZER_PROMPT = """# WhatsApp Conversation Analyzer — system prompt
+
+## Role
+You are the WhatsApp Conversation Analyzer: a silent, periodic reviewer of the \
+operator's recent WhatsApp conversations. You run on a schedule; the operator \
+reviews each run as a normal chat session in folder "Tasks".
+
+## Scope (every run)
+- **Lookback window**: the last {lookback_hours} hour(s) of messages.
+- **Window floor**: call `mcp__oxs_whats2api_bridge__list_messages` with \
+`"since": {since_ts}` on your FIRST call so you only load messages inside the \
+window. Calling it unfiltered pulls the whole table, which exceeds the model's \
+context budget and forces the same re-read every round. One scoped call is \
+enough — do not call it again unless a specific chat needs a second pass.
+- **Skip chats with fewer than {min_messages} message(s) in the window** — pure noise.
+- **You NEVER reply on WhatsApp.** No side effects. Read, decide, persist as notes/tasks/calendar/memory.
+
+## Tools to use (priority order)
+| Signal in chat                                 | Persist via        |
+|------------------------------------------------|--------------------|
+| Promise with a stated deadline                 | `manage_tasks`     |
+| Future event with an unambiguous date/time     | `manage_calendar`  |
+| Decision / context / person fact worth keeping | `manage_notes` or `manage_memory` |
+| New contact / phone / handle                   | `manage_memory`    |
+
+Read tools (always allowed):
+- `mcp__oxs_whats2api_bridge__list_messages`
+- `mcp__oxs_whats2api_bridge__list_events`
+- `mcp__oxs_whats2api_bridge__get_message`
+- `mcp__oxs_whats2api_bridge__list_connections_local`
+- `search_chats`
+
+Plan / dump:
+- `todowrite`
+
+## Hard rules
+1. **NEVER call** `send_message`, `send_reaction`, `send_media`, `mark_read`,
+   `send_presence`, `call_method`, `send_to_session`, `bash`, `host_shell`,
+   `python`, `read_file`, `write_file`, `edit_file`, `apply_patch`. These tools
+   are filtered out at the framework level, but respect the intent.
+2. **No fabrication.** If a deadline is vague ("em breve"), do not create a task.
+   If a date is ambiguous, skip the calendar entry.
+3. **Be terse.** No preamble, no chain-of-thought, no "let me check the data".
+4. **Owner scope.** Only read/write data belonging to this operator.
+
+## Output (always — short and structured)
+
+End your reply with one block, in this exact shape:
+
+```
+Findings (chat: <push_name or jid>):
+- <one line per finding, e.g.>
+  - task: send X to Y by Friday — created
+  - event: meeting Thu 15:00 — created
+  - note: changed delivery address — saved
+  - memory: contact João (11 9 9999-0000) — saved
+- no action needed
+```
+
+If the window has nothing actionable, output exactly:
+`No actionable items in the last {lookback_hours}h.` — and call **zero** write tools.
+
+## Grouping rule
+Group by `chat_jid` / `push_name`. One findings block per chat that yielded
+actionable items. Skip chitchat, greetings, status messages and reactions.
+"""
+
 logger = logging.getLogger("oxs.whats2api_bridge")
 
 
@@ -162,6 +289,14 @@ def _ensure_settings(host) -> None:
     _set_if_empty("request_timeout_seconds", 30)
     _set_if_empty("retention_days", 7)
     _set_if_empty("log_inbound_events", True)
+    _set_if_empty("analyzer_enabled", False)
+    _set_if_empty("analyzer_interval_minutes", 30)
+    _set_if_empty("analyzer_lookback_hours", 24)
+    _set_if_empty("analyzer_min_messages", 3)
+    _set_if_empty(
+        "analyzer_prompt",
+        DEFAULT_ANALYZER_PROMPT,
+    )
 
 
 def _resolve_connection_id(host, args: dict) -> str:
@@ -235,6 +370,14 @@ def _make_async_handler(
 
 
 # ── Tool factories ─────────────────────────────────────────────────────────
+# Rich per-tool descriptions now ship inside ``_read_tools`` (each tool
+# tuple carries a ``description_rich`` string). OxsHost.register_mcp_tool
+# forwards that to the McpManager so tool_index indexes real semantic
+# text. Older workaround ``_enrich_mcp_tool_descriptions`` +
+# ``_MCP_TOOL_DESCRIPTIONS`` was removed when the core team shipped
+# ``MCPToolRegistration.description_rich``.
+
+
 def _read_tools(host, storage: PluginStorage):
     """Read-only tools that query the local extension tables.
 
@@ -243,6 +386,12 @@ def _read_tools(host, storage: PluginStorage):
     "what did this number send me?" or "show me today's events" type
     questions — the data is right here in ``whats2api_bridge__messages``,
     ``whats2api_bridge__events`` and ``whats2api_bridge__connections``.
+
+    Returns a 4-tuple ``(tool_name, schema, handler, description_rich)``
+    per tool. ``description_rich`` is consumed by ``OXSHost.register_mcp_tool``
+    so the tool_index lane indexes the bridge tools with real semantic
+    text — without it the framework falls back to ``"[<ext_id>] <name>"``
+    which the RAG can't match against free-form LLM prompts.
     """
 
     async def _list_messages(client, args, host):
@@ -357,6 +506,12 @@ def _read_tools(host, storage: PluginStorage):
                 "additionalProperties": False,
             },
             _make_async_handler(host, _list_messages, needs_connection_id=False),
+            "List recent WhatsApp messages that the bridge ingested from "
+            "inbound and outbound chats. Filter by connection_id, "
+            "remote_jid substring, direction (in/out), since (epoch "
+            "seconds), and text_search. Returns the same rows the bridge "
+            "persisted locally (whats2api_bridge__messages) — useful for "
+            "examining what a contact sent or what the operator replied.",
         ),
         (
             "get_message",
@@ -367,6 +522,10 @@ def _read_tools(host, storage: PluginStorage):
                 "additionalProperties": False,
             },
             _make_async_handler(host, _get_message, needs_connection_id=False),
+            "Fetch one WhatsApp message by its bridge id (the same id from "
+            "messages.upsert fan-out). Returns the normalized text plus "
+            "the raw Baileys payload. Read-only — does not trigger any "
+            "WhatsApp outbound call.",
         ),
         (
             "list_events",
@@ -381,6 +540,12 @@ def _read_tools(host, storage: PluginStorage):
                 "additionalProperties": False,
             },
             _make_async_handler(host, _list_events, needs_connection_id=False),
+            "List every whats2api event the bridge captured: "
+            "messages.upsert, messages.update, messages.delete, connection."
+            "update, groups.upsert, presence.update, call, etc. Filter by "
+            "event_name and connection_id. Useful for diagnosing what the "
+            "bridge actually received vs what the agent sees as "
+            "conversations.",
         ),
         (
             "list_connections_local",
@@ -390,6 +555,9 @@ def _read_tools(host, storage: PluginStorage):
                 "additionalProperties": False,
             },
             _make_async_handler(host, _list_connections_local, needs_connection_id=False),
+            "List the cached WhatsApp connections known by the bridge in "
+            "this process — id, name, engine, phone, status, owner_id, "
+            "updated_at. Read-only; no outbound call.",
         ),
     ]
 
@@ -1524,6 +1692,48 @@ def _make_admin_handlers(host, storage):
         body = await _read_json(request)
         return await _update_w2a_mcp(host, body)
 
+    # ── Conversation Analyzer ────────────────────────────────────────
+    # GET for status (settings + scheduled-task row + last/next run).
+    # PATCH for updating config (toggles fields + reconciles the
+    # ScheduledTask row in the same call). POST run-now triggers an
+    # immediate execution via the Odysseus task scheduler.
+    async def _get_analyzer(request: Request):
+        return _admin_analyzer_get(host, storage, _request_owner(request))
+
+    async def _patch_analyzer(request: Request):
+        body = await _read_json(request)
+        # Authority is now derived automatically by the core —
+        # ``restore_task_authority`` falls back to ``create_request_authority(prompt)``
+        # when the OXS-created ScheduledTask has no sealed
+        # ``request_authority_json``. We just hand the prompt (and the
+        # operator) to the reconcile path; the core builds the
+        # authority with grants derived from the prompt intent.
+        try:
+            return _admin_analyzer_patch(
+                host, storage, body, _request_owner(request)
+            )
+        except ValueError as e:
+            from fastapi import HTTPException
+            raise HTTPException(400, str(e))
+
+    async def _post_analyzer_run_now(request: Request):
+        return await _admin_analyzer_run_now(host, request)
+
+    async def _get_analyzer_runs(request: Request):
+        qp = dict(request.query_params)
+        try:
+            limit = int(qp.get("limit", 25))
+        except (TypeError, ValueError):
+            limit = 25
+        return _admin_analyzer_list_runs(
+            host, storage, limit=limit, owner=_request_owner(request)
+        )
+
+    async def _get_analyzer_run(request: Request, run_id: str):
+        return _admin_analyzer_get_run(
+            host, storage, run_id, _request_owner(request)
+        )
+
     return {
         "/ext-api/whats2api_bridge/admin/config": {"GET": _get_config, "POST": _post_config},
         "/ext-api/whats2api_bridge/admin/messages": {"GET": _get_messages},
@@ -1537,7 +1747,873 @@ def _make_admin_handlers(host, storage):
         "/ext-api/whats2api_bridge/admin/mcp": {
             "GET": _get_mcp, "PATCH": _patch_mcp,
         },
+        "/ext-api/whats2api_bridge/admin/analyzer": {
+            "GET": _get_analyzer, "PATCH": _patch_analyzer,
+        },
+        "/ext-api/whats2api_bridge/admin/analyzer/run-now": {
+            "POST": _post_analyzer_run_now,
+        },
+        "/ext-api/whats2api_bridge/admin/analyzer/runs": {
+            "GET": _get_analyzer_runs,
+        },
+        "/ext-api/whats2api_bridge/admin/analyzer/runs/{run_id}": {
+            "GET": _get_analyzer_run,
+        },
     }
+
+
+# ── Conversation Analyzer ──────────────────────────────────────────────────
+
+
+def _analyzer_settings(host) -> dict:
+    """Snapshot of the analyzer settings, with safe defaults."""
+    ns = host.get_settings()
+    out = {
+        "enabled": bool(ns.get("analyzer_enabled", False)),
+        "interval_minutes": _coerce_setting_int(ns.get("analyzer_interval_minutes", 30), 30, 5, 720),
+        "lookback_hours":   _coerce_setting_int(ns.get("analyzer_lookback_hours",   24), 24, 1, 168),
+        "min_messages":     _coerce_setting_int(ns.get("analyzer_min_messages",     3),  3, 1, 50),
+        "endpoint_id":      str(ns.get("analyzer_endpoint_id", "") or "").strip(),
+        "model":            str(ns.get("analyzer_model", "") or "").strip(),
+        "prompt":           str(ns.get("analyzer_prompt", "") or "").strip() or DEFAULT_ANALYZER_PROMPT,
+    }
+    return out
+
+
+def _coerce_setting_int(value, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(n, hi))
+
+
+def _analyzer_owner() -> str:
+    """Best-effort resolution of the current operator owner.
+
+    Extensions are loaded in-process and don't have a request scope at
+    register time, so we fall back to the first admin user (matches the
+    ``_migrate_assign_legacy_owner`` behavior in ``core/database.py``).
+    When the operator is logged in, ``run-now`` is invoked from an admin
+    request and we read the real owner out of the request — but at
+    scheduler time there is no request at all.
+
+    Getting this right is not cosmetic. ``stream_agent_loop`` calls
+    ``blocked_tools_for_owner(owner)``; an owner of ``None`` is treated as
+    a *public/non-admin* caller, which (a) denies 55 builtin tools and
+    (b) sets ``mcp_mgr = None`` — i.e. every ``mcp__*`` schema, including
+    the four Whats2API Bridge tools, is dropped from the model's offered
+    surface. The agent then answers "that tool is not exposed in this
+    session" and the analyzer produces no findings.
+
+    ``AuthManager`` exposes ``users`` / ``list_users()`` / ``is_admin()``
+    but has **no** ``get_admin_user()`` — an earlier version of this
+    helper called it, the AttributeError was swallowed, and every task
+    row silently ended up with ``owner=NULL``.
+    """
+    # 1. Real admin from the auth store (same precedence as the core
+    #    legacy-owner sweep: explicit ``is_admin``, else first user).
+    try:
+        from core.auth import AuthManager as _AM
+        users = _AM().users or {}
+        for uname, udata in users.items():
+            if isinstance(udata, dict) and udata.get("is_admin") is True:
+                return str(uname)
+        if users:
+            return str(next(iter(users)))
+    except Exception:
+        pass
+    # 2. Auth-disabled / pre-setup single-user deploys: the admin username
+    #    the operator set in the environment. ``owner_is_admin_or_single_user``
+    #    already returns True for any owner when auth is off, so this only
+    #    keeps the row identity stable across the two modes.
+    try:
+        import os as _os
+        env_user = (_os.getenv("ODYSSEUS_ADMIN_USER") or "").strip()
+        if env_user:
+            return env_user
+    except Exception:
+        pass
+    return ""
+
+
+def _request_owner(request) -> str | None:
+    """Operator behind an admin request, or ``None`` when unattributable.
+
+    Only an *admin* request user is accepted: a bearer-token caller arrives
+    as the sandboxed pseudo-user ``api`` (see ``src.auth_helpers``), and a
+    non-admin would flip ``blocked_tools_for_owner`` into the public-user
+    policy — which also hides every ``mcp__*`` schema from the analyzer.
+    Anything unattributable falls back to :func:`_analyzer_owner`.
+    """
+    if request is None:
+        return None
+    try:
+        from src.auth_helpers import effective_user as _eu
+        user = (_eu(request) or "").strip()
+    except Exception:
+        return None
+    if not user or user == "api":
+        return None
+    try:
+        from core.auth import AuthManager as _AM
+        if _AM().is_admin(user):
+            return user
+    except Exception:
+        return None
+    return None
+
+
+def _analyzer_resolve_endpoint(db, settings: dict) -> tuple[str, str]:
+    """Pick (endpoint_url, model) for the analyzer task.
+
+    Resolution order (first non-empty wins per field):
+      1. Operator overrides — ``settings.endpoint_id`` / ``settings.model``.
+      2. The operator's configured "default" endpoint + model — the same
+         path Odysseus uses for unscheduled chat. Empty ``model`` falls
+         back to the first non-hidden model on the resolved endpoint.
+      3. First enabled ``ModelEndpoint`` row (legacy safety net; the
+         ``default`` resolver above should hit this on most installs).
+
+    Returns ``("", "")`` if nothing is configured — caller should skip.
+    """
+    try:
+        url, model = "", ""
+        endpoint_id = (settings.get("endpoint_id") or "").strip()
+        explicit_model = (settings.get("model") or "").strip()
+
+        # Fast path — explicit override for both fields. Skips the
+        # ``resolve_endpoint`` chain entirely (faster, and avoids the
+        # headers-shape divergence the chain can introduce for in-process
+        # callers — the scheduler injects headers on its end).
+        if endpoint_id:
+            from core.database import ModelEndpoint as _ME
+            q = db.query(_ME).filter(
+                _ME.id == endpoint_id,
+                _ME.is_enabled == True,  # noqa: E712
+            )
+            me = q.first()
+            if me is not None:
+                base = (me.base_url or "").rstrip("/")
+                if not base.endswith("/v1"):
+                    base = base + "/v1"
+                url = base
+                if explicit_model:
+                    model = explicit_model
+                else:
+                    try:
+                        cached = me.cached_models
+                        if isinstance(cached, str):
+                            cached = json.loads(cached)
+                        if isinstance(cached, list) and cached:
+                            model = cached[0]
+                    except Exception:
+                        pass
+
+        # Fall back to the user's configured "default" model when the
+        # operator did not pin a specific endpoint.
+        if not url or not model:
+            owner = _analyzer_owner()
+            try:
+                from src.endpoint_resolver import resolve_endpoint
+                r_url, r_model, _r_headers = resolve_endpoint(
+                    setting_prefix="default", owner=owner or None,
+                )
+                if r_url and r_model:
+                    url = url or r_url
+                    model = model or r_model
+            except Exception:
+                pass
+
+        # Last resort — first enabled endpoint, with cached_models[0].
+        if not url or not model:
+            from core.database import ModelEndpoint as _ME
+            me = (
+                db.query(_ME)
+                .filter(_ME.is_enabled == True)  # noqa: E712
+                .order_by(_ME.id.asc())
+                .first()
+            )
+            if me is not None:
+                base = (me.base_url or "").rstrip("/")
+                if not base.endswith("/v1"):
+                    base = base + "/v1"
+                url = url or base
+                if not model:
+                    try:
+                        cached = me.cached_models
+                        if isinstance(cached, str):
+                            cached = json.loads(cached)
+                        if isinstance(cached, list) and cached:
+                            model = cached[0]
+                    except Exception:
+                        pass
+
+        return ((url or "").rstrip("/"), (model or ""))
+    except Exception:
+        return ("", "")
+
+
+def _analyzer_ensure_crew(db, owner: str | None = None) -> str | None:
+    """Create/refresh the CrewMember that enforces the analyzer's tool allowlist.
+
+    Returns the ``crew_member_id`` (or None if the table isn't accessible).
+    The crew member has ``enabled_tools`` set to :data:`ANALYZER_ALLOWED_TOOLS`
+    so the scheduler inverts it into a ``disabled_tools`` set on every run,
+    — hard-blocking every WhatsApp write tool regardless of what the LLM
+    tries to call.
+
+    The row is scoped by ``name`` rather than ``id`` because owners in
+    multi-user deploys must not share the agent.
+    """
+    try:
+        from core.database import CrewMember as _CM
+        import uuid as _uuid
+        owner = owner if owner is not None else _analyzer_owner()
+        crew = (
+            db.query(_CM)
+            .filter(_CM.name == ANALYZER_CREW_NAME)
+            .filter(_CM.owner == owner if owner else _CM.owner.is_(None))
+            .first()
+        )
+        import json as _json
+        tools_json = _json.dumps(list(ANALYZER_ALLOWED_TOOLS))
+        if crew is None:
+            crew = _CM(
+                id=str(_uuid.uuid4()),
+                name=ANALYZER_CREW_NAME,
+                owner=owner or None,
+                personality=DEFAULT_ANALYZER_PROMPT,
+                enabled_tools=tools_json,
+                is_default_assistant=False,
+            )
+            db.add(crew)
+            db.commit()
+            db.refresh(crew)
+        else:
+            # Refresh in case the allowed list grew.
+            if crew.enabled_tools != tools_json:
+                crew.enabled_tools = tools_json
+                db.commit()
+        return str(crew.id) if crew else None
+    except Exception as e:
+        logger.warning("whats2api_bridge: could not ensure analyzer crew: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+# Statuses that must never be picked up as "the" analyzer task again.
+_ANALYZER_DEAD_STATUSES = ("completed", "cancelled", "failed")
+
+
+def _analyzer_find_task(db, owner: str | None = None) -> "object | None":
+    """Locate the analyzer's ScheduledTask row (any status).
+
+    Prefers the live row (``active``/``paused``) over retired duplicates so a
+    leftover ``completed`` row from a previous owner cannot shadow the one the
+    scheduler actually runs.
+    """
+    try:
+        from core.database import ScheduledTask as _ST
+        owner = owner if owner is not None else _analyzer_owner()
+        rows = (
+            db.query(_ST)
+            .filter(_ST.name == ANALYZER_TASK_NAME)
+            .filter(
+                _ST.owner == owner if owner else _ST.owner.is_(None)
+            )
+            .all()
+        )
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+    if not rows:
+        return None
+    live = [r for r in rows if (r.status or "") not in _ANALYZER_DEAD_STATUSES]
+    pool = live or list(rows)
+    # Oldest row wins so the task id (and its TaskRun history) stays stable.
+    pool.sort(key=lambda r: str(getattr(r, "id", "") or ""))
+    return pool[0]
+
+
+def _analyzer_dedupe_tasks(db, owner: str | None = None) -> int:
+    """Retire duplicate analyzer tasks left behind by the ``owner=NULL`` bug.
+
+    Older builds resolved the operator owner through a nonexistent
+    ``AuthManager.get_admin_user()``, so every reconcile minted a fresh
+    ``owner=NULL`` task. The core boot sweep (``_migrate_assign_legacy_owner``)
+    later reassigns those rows to the admin user, which leaves *several*
+    ``active`` tasks with the same name — all of them firing on the same cron
+    and burning one LLM run each. Keep exactly one live row per owner.
+
+    Returns the number of rows retired.
+    """
+    try:
+        from core.database import ScheduledTask as _ST
+        owner = owner if owner is not None else _analyzer_owner()
+        rows = (
+            db.query(_ST)
+            .filter(_ST.name == ANALYZER_TASK_NAME)
+            .all()
+        )
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+    retired = 0
+    if owner:
+        # Unattributed rows are always our own leftovers: adopt the first one
+        # when the owner has no task yet, otherwise retire it.
+        orphans = [r for r in rows if not (r.owner or "")]
+        owned = [r for r in rows if (r.owner or "") == owner]
+        if owned:
+            for row in orphans:
+                row.status = "completed"
+                retired += 1
+        elif orphans:
+            orphans.sort(key=lambda r: str(getattr(r, "id", "") or ""))
+            for row in orphans[1:]:
+                row.status = "completed"
+                retired += 1
+            orphans[0].owner = owner
+            rows = [r for r in rows if r is not orphans[0]]
+    live = [
+        r for r in rows
+        if (r.status or "") not in _ANALYZER_DEAD_STATUSES
+        and (r.owner or "") == (owner or "")
+    ]
+    if len(live) > 1:
+        live.sort(key=lambda r: str(getattr(r, "id", "") or ""))
+        for row in live[1:]:
+            row.status = "completed"
+            retired += 1
+    if retired:
+        try:
+            db.commit()
+            logger.info(
+                "whats2api_bridge: retired %d duplicate analyzer task row(s) "
+                "for owner=%r", retired, owner or None,
+            )
+        except Exception as e:
+            logger.warning("whats2api_bridge: task dedupe commit failed: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return 0
+    return retired
+
+
+def _analyzer_set_all_tasks_status(db, status: str) -> int:
+    """Force every analyzer task row (any owner) into ``status``.
+
+    ``on_disable`` / ``on_uninstall`` must not depend on owner resolution:
+    a stray ``owner=NULL`` row left by an older build would keep firing on
+    the cron after the operator turned the extension off.
+    """
+    try:
+        from core.database import ScheduledTask as _ST
+        rows = (
+            db.query(_ST)
+            .filter(_ST.name == ANALYZER_TASK_NAME)
+            .all()
+        )
+        changed = 0
+        for row in rows:
+            if (row.status or "") != status:
+                row.status = status
+                changed += 1
+        if changed:
+            db.commit()
+        return changed
+    except Exception as e:
+        logger.warning(
+            "whats2api_bridge: could not set analyzer tasks to %r: %s",
+            status, e,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def _analyzer_cron_for(interval_minutes: int) -> str:
+    """Build a cron expression that fires every ``interval_minutes`` minutes.
+
+    Cron has no ``*/N`` shorthand for N>59; for those we spread across the
+    hour so the cron stays valid (e.g. every 90 min → at :00 and :30 every
+    other hour). For intervals >= 60 we'll use ``M * * * *`` plus a
+    ``*/N`` on the minute to keep it always-firing without alignment drift.
+    """
+    n = max(5, min(int(interval_minutes), 720))
+    if n <= 59:
+        return f"*/{n} * * * *"
+    # 60..720 → pick a divisor d that fits 1..59 and use a coarser schedule.
+    # Strategy: every n minutes from min 0 with N>=60 collapses into
+    # an hour-aligned interval. We split into min step <=59 and an hour step.
+    for step in (5, 6, 10, 15, 20, 30):
+        if n % step == 0:
+            hours = n // step
+            if hours <= 23:
+                return f"*/{step} */{hours} * * *"
+    # Fallback: align to /30 minutes plus every 2h.
+    return "*/30 */2 * * *"
+
+
+def _analyzer_reconcile(host, db, owner: str | None = None) -> dict:
+    """Apply current settings to the ScheduledTask row.
+
+    - enabled + cron match → row active (no-op if already active).
+    - disabled → row paused (preserve config; don't drop it).
+    - missing row + enabled → create the row + ensure crew.
+
+    Authority handling now lives entirely in core:
+    ``restore_task_authority`` falls back to ``create_request_authority(prompt)``
+    when the OXS-created task has no sealed ``request_authority_json``,
+    so the agent loop gets intent-derived grants at run time without the
+    extension needing to mint JSON.
+    """
+    s = _analyzer_settings(host)
+    owner = owner if owner is not None else _analyzer_owner()
+    # Retire the duplicate ``owner=NULL`` rows older builds used to mint.
+    # Must run before the lookup, otherwise a leftover row shadows the one
+    # the scheduler is supposed to run.
+    try:
+        _analyzer_dedupe_tasks(db, owner)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("whats2api_bridge: analyzer dedupe skipped: %s", exc)
+    task = _analyzer_find_task(db, owner)
+    if not s["enabled"]:
+        if task and task.status != "paused":
+            task.status = "paused"
+            db.commit()
+        return {
+            "ok": True,
+            "applied": "paused",
+            "task_id": str(task.id) if task else None,
+            "enabled": False,
+        }
+
+    endpoint_url, model = _analyzer_resolve_endpoint(db, s)
+    if not endpoint_url or not model:
+        return {
+            "ok": False,
+            "error": (
+                "No model endpoint is configured (or the chosen "
+                "endpoint_id is unavailable). Set one in Settings → "
+                "Models, or pick a different analyzer_endpoint_id."
+            ),
+            "enabled": True,
+        }
+
+    cron = _analyzer_cron_for(s["interval_minutes"])
+    # Substitute the two documented placeholders. We always do this
+    # even when the resolved prompt is the DEFAULT_ANALYZER_PROMPT —
+    # otherwise a downstream literal ``{min_messages}`` would reach
+    # the LLM and confuse it.
+    #
+    # ``{since_ts}`` is deliberately left in the stored prompt. The task
+    # scheduler expands it on every execution (see
+    # ``src/task_scheduler._expand_live_prompt_placeholders``), so the
+    # lookback window stays fresh across cron ticks instead of freezing
+    # the cutoff at reconcile time.
+    prompt = s["prompt"].replace(
+        "{lookback_hours}", str(s["lookback_hours"])
+    ).replace(
+        "{min_messages}",   str(s["min_messages"])
+    )
+    crew_id = _analyzer_ensure_crew(db, owner)
+
+    if task is None:
+        from core.database import ScheduledTask as _ST
+        import uuid as _uuid
+        task = _ST(
+            id=str(_uuid.uuid4()),
+            owner=owner or None,
+            name=ANALYZER_TASK_NAME,
+            prompt=prompt,
+            task_type="llm",
+            action=None,
+            schedule="cron",
+            cron_expression=cron,
+            trigger_type="schedule",
+            status="active",
+            output_target="session",
+            endpoint_url=endpoint_url,
+            model=model,
+            crew_member_id=crew_id,
+            notifications_enabled=True,
+        )
+        db.add(task)
+        db.commit()
+        action = "created"
+    else:
+        changed = False
+        if task.status != "active":
+            task.status = "active"
+            changed = True
+        if (task.cron_expression or "") != cron:
+            task.cron_expression = cron
+            changed = True
+        if (task.prompt or "") != prompt:
+            task.prompt = prompt
+            changed = True
+        if (task.endpoint_url or "") != endpoint_url:
+            task.endpoint_url = endpoint_url
+            changed = True
+        if (task.model or "") != model:
+            task.model = model
+            changed = True
+        if (task.crew_member_id or "") != (crew_id or ""):
+            task.crew_member_id = crew_id
+            changed = True
+        if changed:
+            db.commit()
+        action = "updated" if changed else "noop"
+
+    # Best-effort: nudge the scheduler so the new cron takes effect
+    # within one tick instead of waiting up to 10s. The scheduler is
+    # registered globally by app.py via ``src.event_bus.set_task_scheduler``
+    # — import from there, not from ``src.task_scheduler`` (which only
+    # exposes ``TaskScheduler`` itself, no registry).
+    try:
+        from src.event_bus import get_task_scheduler as _get_sched
+        sched_obj = _get_sched()
+        if sched_obj is not None and hasattr(sched_obj, "_loop"):
+            # No public API to force a wake; the scheduler polls every
+            # 1–60s, so a single tick is the worst-case lag anyway.
+            pass
+    except Exception:
+        sched_obj = None
+    return {
+        "ok": True,
+        "applied": action,
+        "task_id": str(task.id),
+        "enabled": True,
+        "endpoint_url": endpoint_url,
+        "model": model,
+        "cron": cron,
+        "interval_minutes": s["interval_minutes"],
+        "lookback_hours": s["lookback_hours"],
+        "min_messages": s["min_messages"],
+    }
+
+
+def _analyzer_status(host, db, owner: str | None = None) -> dict:
+    """Status snapshot consumed by the UI admin endpoint."""
+    s = _analyzer_settings(host)
+    task = _analyzer_find_task(db, owner)
+    out = {
+        "ok": True,
+        "settings": s,
+        "task": None,
+        "last_run": None,
+        "next_run": None,
+        "run_count": 0,
+        "default_prompt": DEFAULT_ANALYZER_PROMPT,
+        "placeholders": ["lookback_hours", "min_messages"],
+    }
+    if task is not None:
+        out["task"] = {
+            "id": str(task.id),
+            "status": task.status,
+            "cron": task.cron_expression,
+            "endpoint_url": task.endpoint_url,
+            "model": task.model,
+            "session_id": getattr(task, "session_id", None),
+            "schedule": task.schedule,
+        }
+        out["last_run"] = (
+            task.last_run.isoformat() if getattr(task, "last_run", None) else None
+        )
+        out["next_run"] = (
+            task.next_run.isoformat() if getattr(task, "next_run", None) else None
+        )
+        out["run_count"] = int(getattr(task, "run_count", 0) or 0)
+    out["resolved"] = _analyzer_resolve_endpoint(db, s)
+    return out
+
+
+def _analyzer_list_runs(host, db, *, limit: int = 25, owner: str | None = None) -> dict:
+    """Return recent ``TaskRun`` rows for this analyzer's task.
+
+    Each row carries the LLM's final assistant message preview (the
+    ``result`` column), tokens_used, model, timing, status — plus the
+    ``session_id`` that ties the run to the long-lived chat session
+    where the full conversation + tool calls land (look there for the
+    ground truth).
+    """
+    try:
+        from core.database import ScheduledTask, TaskRun
+        task = _analyzer_find_task(db, owner)
+        if task is None:
+            return {
+                "ok": True,
+                "rows": [],
+                "task_id": None,
+                "session_id": None,
+                "note": "no ScheduledTask row yet (reconcile first)",
+            }
+        q = (
+            db.query(TaskRun)
+            .filter(TaskRun.task_id == task.id)
+            .order_by(TaskRun.started_at.desc())
+        )
+        try:
+            limit_i = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit_i = 25
+        runs = q.limit(limit_i).all()
+
+        rows = []
+        for r in runs:
+            started = getattr(r, "started_at", None)
+            finished = getattr(r, "finished_at", None)
+            duration = None
+            try:
+                if started and finished:
+                    duration = max(0, int((finished - started).total_seconds()))
+            except Exception:
+                pass
+            result = getattr(r, "result", None) or ""
+            result_preview = result[:320]
+            result_more = len(result) > 320
+            rows.append({
+                "id": str(r.id),
+                "started_at": started.isoformat() if started else None,
+                "finished_at": finished.isoformat() if finished else None,
+                "duration_seconds": duration,
+                "status": r.status,
+                "model": getattr(r, "model", None) or (task.model if task else None),
+                "tokens_used": getattr(r, "tokens_used", None),
+                "result_preview": result_preview,
+                "result_truncated": result_more,
+                "result_length": len(result),
+                "error": (r.error or None) if r.status == "error" else None,
+            })
+
+        return {
+            "ok": True,
+            "rows": rows,
+            "task_id": str(task.id),
+            "session_id": getattr(task, "session_id", None),
+            "session_name": task.name,
+        }
+    except Exception as e:
+        logger.warning("whats2api_bridge: list_runs failed: %s", e)
+        return {"ok": False, "error": str(e), "rows": []}
+
+
+def _analyzer_get_run(host, db, run_id: str, owner: str | None = None) -> dict:
+    """Single-run detail: full result (truncated for safety), timing, status."""
+    try:
+        from core.database import ScheduledTask, TaskRun
+        task = _analyzer_find_task(db, owner)
+        if task is None:
+            return {"ok": False, "error": "no ScheduledTask row"}
+        run = (
+            db.query(TaskRun)
+            .filter(TaskRun.id == run_id, TaskRun.task_id == task.id)
+            .first()
+        )
+        if run is None:
+            return {"ok": False, "error": "run not found", "run_id": run_id}
+        started = run.started_at
+        finished = run.finished_at
+        duration = None
+        try:
+            if started and finished:
+                duration = max(0, int((finished - started).total_seconds()))
+        except Exception:
+            pass
+        result = getattr(run, "result", None) or ""
+        return {
+            "ok": True,
+            "run": {
+                "id": str(run.id),
+                "task_id": str(run.task_id),
+                "started_at": started.isoformat() if started else None,
+                "finished_at": finished.isoformat() if finished else None,
+                "duration_seconds": duration,
+                "status": run.status,
+                "model": getattr(run, "model", None) or (task.model if task else None),
+                "tokens_used": getattr(run, "tokens_used", None),
+                "result": result[:8000],
+                "result_truncated": len(result) > 8000,
+                "result_length": len(result),
+                "error": run.error,
+            },
+            "task": {
+                "id": str(task.id),
+                "name": task.name,
+                "session_id": getattr(task, "session_id", None),
+            },
+        }
+    except Exception as e:
+        logger.warning("whats2api_bridge: get_run failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def _analyzer_run_now(host, db, owner: str | None = None) -> dict:
+    """Trigger an immediate execution of the analyzer's ScheduledTask.
+
+    ``run_task_now`` is now synchronous (returns ``TaskRun.id | None``
+    directly) — no ``await``, no coroutine unwrap. The async signature
+    is preserved on this function so the route handler stays unchanged.
+
+    ``owner`` is the request-scope operator when called from the admin
+    route; the scheduled path passes nothing and falls back to
+    :func:`_analyzer_owner`.
+    """
+    s = _analyzer_settings(host)
+    if not s["enabled"]:
+        return {"ok": False, "error": "analyzer is disabled — toggle it on first"}
+    rec = _analyzer_reconcile(host, db, owner)
+    if not rec.get("ok"):
+        return rec
+    task_id = rec.get("task_id")
+    if not task_id:
+        return {"ok": False, "error": "no task row to run"}
+    try:
+        from src.event_bus import get_task_scheduler as _get
+        sched = _get()
+        if sched is None:
+            return {
+                "ok": False,
+                "task_id": task_id,
+                "error": "scheduler is not initialised in this process",
+            }
+        run_id = sched.run_task_now(task_id, force=True)
+        return {
+            "ok": run_id is not None,
+            "task_id": task_id,
+            "run_id": run_id,
+            "owner": owner or _analyzer_owner() or None,
+            "triggered_at": int(time.time()),
+            "error": None if run_id else "scheduler refused the trigger",
+        }
+    except Exception as e:
+        logger.warning("whats2api_bridge: run_task_now failed: %s", e)
+        return {"ok": False, "error": f"scheduler rejected run: {e}", "task_id": task_id}
+
+
+def _admin_analyzer_get(host, storage, owner: str | None = None, **_kwargs) -> dict:
+    SessionLocal, _ = _mcp_models()  # noqa: F841 — same DB access helper
+    from core.database import SessionLocal as _SL
+    db = _SL()
+    try:
+        return _analyzer_status(host, db, owner)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _admin_analyzer_list_runs(host, storage, *, limit: int = 25, owner: str | None = None) -> dict:
+    from core.database import SessionLocal as _SL
+    db = _SL()
+    try:
+        return _analyzer_list_runs(host, db, limit=limit, owner=owner)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _admin_analyzer_get_run(host, storage, run_id: str, owner: str | None = None) -> dict:
+    from core.database import SessionLocal as _SL
+    db = _SL()
+    try:
+        return _analyzer_get_run(host, db, run_id, owner)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _admin_analyzer_patch(host, storage, body: dict, owner: str | None = None) -> dict:
+    """Update analyzer settings + reconcile into the ScheduledTask row.
+
+    Authority mint is no longer needed: ``restore_task_authority`` in
+    core now derives grants from the prompt intent when the OXS-created
+    ScheduledTask has no sealed ``request_authority_json``.
+    """
+    ns = host.get_settings()
+    changed = False
+    if "enabled" in body:
+        ns.set("analyzer_enabled", bool(body["enabled"]))
+        changed = True
+    if "interval_minutes" in body:
+        ns.set("analyzer_interval_minutes", _coerce_setting_int(body["interval_minutes"], 30, 5, 720))
+        changed = True
+    if "lookback_hours" in body:
+        ns.set("analyzer_lookback_hours", _coerce_setting_int(body["lookback_hours"], 24, 1, 168))
+        changed = True
+    if "min_messages" in body:
+        ns.set("analyzer_min_messages", _coerce_setting_int(body["min_messages"], 3, 1, 50))
+        changed = True
+    if "endpoint_id" in body:
+        ns.set("analyzer_endpoint_id", str(body["endpoint_id"] or "").strip())
+        changed = True
+    if "model" in body:
+        ns.set("analyzer_model", str(body["model"] or "").strip())
+        changed = True
+    if "prompt" in body:
+        prompt = str(body["prompt"] or "").strip()
+        if len(prompt) > 8192:
+            raise ValueError("prompt too long (max 8192 chars)")
+        ns.set("analyzer_prompt", prompt)
+        changed = True
+    if not changed:
+        return {"ok": True, "applied": "noop"}
+
+    from core.database import SessionLocal as _SL
+    db = _SL()
+    try:
+        rec = _analyzer_reconcile(host, db, owner)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    return rec
+
+
+async def _admin_analyzer_run_now(host, request: Request) -> dict:
+    """Trigger an immediate analyzer run.
+
+    Lives at module level so it can be unit-tested without the OXS
+    request layer; the route wrapper (``_post_analyzer_run_now``)
+    forwards ``host`` from its closure scope. Owner resolution is the
+    only thing we have to do at request scope (vs the scheduled path
+    which has no request at all).
+
+    ``AuthManager`` has no ``get_current_user()`` — the request-scope
+    user comes from ``src.auth_helpers.effective_user`` (set by the auth
+    middleware) and is only trusted when it is an admin.
+    """
+    owner = _request_owner(request)
+    from core.database import SessionLocal as _SL
+    db = _SL()
+    try:
+        return await _analyzer_run_now(host, db, owner)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ── register(host) ─────────────────────────────────────────────────────────
@@ -1646,8 +2722,26 @@ def register(host):
         host.subscribe_event("oxs.rescan", _on_rescan)
 
         # ── MCP tools ─────────────────────────────────────────────────
-        for tool_name, schema, handler in _read_tools(host, storage):
-            host.register_mcp_tool(TOOL_NS, tool_name, schema, handler)
+        # Each tool ships with a ``description_rich`` so the tool_index
+        # RAG pass returns them when the prompt mentions WhatsApp
+        # messages, conversations, or recent activity — without it the
+        # framework would fall back to ``"[<ext_id>] <name>"`` which
+        # the semantic retriever can't match.
+        #
+        # ``read_only=True`` declares every one of these to the capability
+        # / approval gate as a brokered private read. All four are pure
+        # local SELECTs over the extension's own tables (no outbound
+        # whats2api call, no mutation). Without the declaration the gate
+        # classifies them as unknown and refuses the call as soon as any
+        # untrusted context is in the transcript — which the tool catalog
+        # injection itself guarantees — so a scheduled analyzer task could
+        # never actually read a message.
+        for tool_name, schema, handler, description_rich in _read_tools(host, storage):
+            host.register_mcp_tool(
+                TOOL_NS, tool_name, schema, handler,
+                description_rich=description_rich,
+                read_only=True,
+            )
 
         # ── Inbound webhook for whats2api events ──────────────────────
         # The framework's ``register_webhook`` always generates a fresh
@@ -1708,14 +2802,62 @@ def register(host):
             owner=None,
         )
 
+        # ── Conversation Analyzer: reconcile the ScheduledTask row ────
+        # Best-effort. If Settings → Models has nothing configured yet
+        # the operator will see a clear error in the next UI status
+        # call. The DB session is short-lived because the scheduler
+        # might be far away from this hook's call site.
+        try:
+            from core.database import SessionLocal as _SL_enable
+            db_e = _SL_enable()
+            try:
+                rec = _analyzer_reconcile(host, db_e)
+                logger.info("whats2api_bridge analyzer reconcile: %s", rec.get("applied"))
+            finally:
+                try:
+                    db_e.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("whats2api_bridge: analyzer reconcile skipped: %s", e)
+
         logger.info("whats2api_bridge enabled")
 
     @host.on_disable
     def _disable():
+        # Pause the analyzer's ScheduledTask (preserve config; do not
+        # drop the row so the operator can re-enable with one click).
+        try:
+            from core.database import SessionLocal as _SL_disable
+            db_d = _SL_disable()
+            try:
+                _analyzer_set_all_tasks_status(db_d, "paused")
+            finally:
+                try:
+                    db_d.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("whats2api_bridge: analyzer pause on disable failed: %s", e)
         logger.info("whats2api_bridge disabled")
 
     @host.on_uninstall
     def _uninstall():
+        # Mark the analyzer's ScheduledTask completed so the scheduler
+        # stops picking it up. We do not delete the CrewMember so a
+        # reinstall with the same owner keeps the operator's voice.
+        try:
+            from core.database import SessionLocal as _SL_uninst
+            db_u = _SL_uninst()
+            try:
+                _analyzer_set_all_tasks_status(db_u, "completed")
+            finally:
+                try:
+                    db_u.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("whats2api_bridge: analyzer uninstall cleanup failed: %s", e)
         logger.info("whats2api_bridge uninstalled")
 
     def _on_rescan(payload):

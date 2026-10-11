@@ -14599,11 +14599,23 @@ def _build_system_prompt(
         disabled_tools,
     )
     mcp_schemas = []
+    _mcp_raw_count = 0
     if mcp_mgr:
+        _mcp_raw = mcp_mgr.get_all_openai_schemas(_effective_mcp_disabled_map)
+        _mcp_raw_count = len(_mcp_raw)
         mcp_schemas = _filter_raw_browser_mcp_schemas(
-            mcp_mgr.get_all_openai_schemas(_effective_mcp_disabled_map),
+            _mcp_raw,
             disabled_tools,
         )
+    logger.info(
+        "[prompt-mcp] mcp_mgr=%s disabled_map=%s raw=%d kept=%d names=%s",
+        bool(mcp_mgr),
+        {k: sorted(v) for k, v in (_effective_mcp_disabled_map or {}).items()
+         if v},
+        _mcp_raw_count,
+        len(mcp_schemas),
+        [ (s.get("function") or {}).get("name") for s in mcp_schemas ][:20],
+    )
 
     set_active_model(model)
 
@@ -21030,20 +21042,24 @@ def _enforce_caller_disabled_tool_policy(
     User-added MCP integrations (e.g. the Whats2API Bridge) are exempt from
     caller denials: a server-wide denylist that targets builtin email/browser
     tools must not silently hide the very MCP tools the user just connected.
-    Preserve any `mcp__*` tool that already lives in ``relevant_tools`` or
-    ``base_relevant_tools`` so the model can still pick them up.
+    Preserve any tool that already passed the relevance pass for this turn
+    so the model can still reach for it; the dispatch layer (``request_authority``)
+    still gates the actual execution per request.
     """
 
     hard_disabled = set(caller_disabled or set())
     if not hard_disabled:
         return relevant_tools, base_relevant_tools, tool_policy
-    # Protect user-added MCP tools from caller denials (mostly derived from
-    # the default tool_policy that lists builtin email/browser names as hidden).
-    protected_mcp: Set[str] = set()
+    # Protect any tool that already cleared the relevance/routing pass. The
+    # previous version only protected ``mcp__*`` names, which let a caller-
+    # side denylist silently remove builtin tools the turn actually needed
+    # (e.g. ``manage_calendar`` for an LLM scheduled task whose allowlist
+    # enables it). The relevance pass is the turn-scoped contract, so its
+    # outcome cannot be quietly undone by a server-wide default.
+    protected: Set[str] = set()
     for t in (relevant_tools or set()) | (base_relevant_tools or set()):
-        if t.startswith("mcp__"):
-            protected_mcp.add(t)
-    effective_disabled = hard_disabled - protected_mcp
+        protected.add(t)
+    effective_disabled = hard_disabled - protected
     disabled_tools.update(effective_disabled)
     if relevant_tools is not None:
         relevant_tools.difference_update(effective_disabled)
@@ -21264,6 +21280,21 @@ async def stream_agent_loop(
             exact_approval and exact_approval.allow_remaining_actions
         ),
         delegated_credential=bool(delegated_credential),
+        # A background task runner (``src.task_scheduler``) computes this set
+        # from the operator's crew allowlist plus its own RAG selection and
+        # passes it as ``relevant_tools``. It is server-owned, never model
+        # output and never derived from untrusted content. Foreground chat
+        # passes ``relevant_tools=None`` (or a prompt-derived set) and is
+        # deliberately excluded below.
+        declared_task_tools=(
+            frozenset(relevant_tools or ())
+            if (
+                workload == "background"
+                and relevant_tools
+                and not delegated_credential
+            )
+            else frozenset()
+        ),
     )
     _has_tui_host_bridge = _tui_host_bridge_is_usable(client_runtime_context)
     if (
@@ -21337,6 +21368,13 @@ async def stream_agent_loop(
             mcp_mgr = None
     guide_only = bool(tool_policy and tool_policy.mode == "guide_only")
     public_blocked_tools = blocked_tools_for_owner(owner)
+    logger.info(
+        "[mcp-mgr] owner=%r tool_policy=%s disable_mcp=%s public_blocked=%d",
+        owner,
+        bool(tool_policy),
+        bool(getattr(tool_policy, "disable_mcp", False)),
+        len(public_blocked_tools),
+    )
     if normalized_external_tool_schemas:
         public_blocked_tools = set(public_blocked_tools) - {
             schema["function"]["name"]
@@ -26241,6 +26279,22 @@ async def stream_agent_loop(
         logger.info("[agent-routing-audit] %s", json.dumps(_routing_audit, sort_keys=True))
         yield f'data: {json.dumps(_routing_audit)}\n\n'
 
+        # Finding 7 follow-up Layer 3 — surface the "selected but not
+        # offered" symptom in plain WARNING logs, not only the audit
+        # stream. Without this, a McpManager cache wipe that bypassed
+        # the auto-restore leaves the LLM with no usable tool while
+        # the only evidence is buried in a verbose JSON audit line.
+        # The log triggers operator alerting via the same channel the
+        # rest of the agent loop uses.
+        if _routing_audit.get("selected_not_offered"):
+            logger.warning(
+                "[agent] selected-but-not-offered tools (%d): %s. "
+                "If this fires repeatedly, the McpManager in-process "
+                "tool cache is stale — check OXS auto-restore logs.",
+                len(_routing_audit["selected_not_offered"]),
+                _routing_audit["selected_not_offered"],
+            )
+
         # Once a fallback produces substantive output, keep that exact route
         # pinned for every later tool round instead of retrying the primary.
         def _runtime_candidate(candidate):
@@ -28856,6 +28910,15 @@ async def stream_agent_loop(
             )
         elif (
             _qwen_explicit_tool
+            # Only synthesize a call when the model emitted none of its own.
+            # The detectors above scan the *whole* user turn, so a long
+            # structured prompt (an OXS scheduled-task prompt, a skill body,
+            # pasted docs) that merely MENTIONS memory/tasks/skills would
+            # otherwise REPLACE the model's real native tool calls with a
+            # single synthetic manage_memory/manage_tasks block — the exact
+            # call the caller's allowlist then rejects. The contextual
+            # calendar branch above already carries this guard.
+            and not tool_blocks
             and not _has_accepted_contract_tool_call(turn_contract, tool_blocks)
             and (
                 _caller_relevant_tools is None
@@ -33255,6 +33318,14 @@ async def stream_agent_loop(
                 block.tool_type,
                 block.content,
             )
+            if not security_decision.allowed:
+                logger.info(
+                    "[agent-gate] %s refused: %s (untrusted=%s sources=%s)",
+                    block.tool_type,
+                    security_decision.reason,
+                    run_security.external_untrusted_context_seen,
+                    list(run_security.external_sources),
+                )
             _ody_clamped_tool_allowed = (
                 _ody_notes_finetune_mode
                 and block.tool_type in {"manage_notes", "manage_calendar", "manage_tasks"}

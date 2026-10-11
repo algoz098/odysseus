@@ -65,6 +65,34 @@ def compose_task_relevant_tools(rag_tools, assistant_always, disabled_tools):
     return tools
 
 
+# Placeholders an extension may leave in a stored task prompt for values only
+# knowable at fire time. Substituting them at reconcile time would freeze a
+# timestamp that goes stale between ticks, so the scheduler resolves them
+# on every execution instead.
+_LIVE_PROMPT_PLACEHOLDERS = ("{since_ts}",)
+
+
+def _expand_live_prompt_placeholders(prompt: str) -> str:
+    """Resolve fire-time placeholders in a stored task prompt.
+
+    ``{since_ts}`` is the only one today: the whats2api analyzer needs the
+    epoch cutoff of its own lookback window on every run, and a value baked
+    at reconcile time would shrink the window a little more on every tick
+    until the task stopped seeing any messages at all. Unknown placeholders
+    are left untouched so a prompt that legitimately contains literal braces
+    is never corrupted.
+    """
+    if not prompt or not any(tok in prompt for tok in _LIVE_PROMPT_PLACEHOLDERS):
+        return prompt
+    import time as _time
+    resolved = {
+        "{since_ts}": str(int(_time.time()) - 24 * 3600),
+    }
+    for token, value in resolved.items():
+        prompt = prompt.replace(token, value)
+    return prompt
+
+
 # ── Shared TTL cache (singleflight) ────────────────────────────────────────
 # Multiple scheduled tasks firing in the same minute often need the same
 # external data (Miniflux unreads, MCP tool snapshots, etc.). This cache
@@ -819,31 +847,20 @@ class TaskScheduler:
         finally:
             db.close()
 
-    async def _execute_task(self, task_id: str, *, bypass_model_slot: bool = False, release_executing: bool = True):
-        # Create the run record with status="queued" BEFORE waiting on the
-        # semaphore so the UI can show that a manually-triggered task is in
-        # line behind another. Once we acquire the slot, flip to "running"
-        # and hand off to _execute_task_locked.
+    async def _execute_task(self, task_id: str, *, run_id: str | None = None,
+                             bypass_model_slot: bool = False, release_executing: bool = True):
+        # ``run_id`` is pre-created by ``run_task_now`` (the manual trigger
+        # path) so callers can return a stable identifier synchronously. The
+        # scheduler tick and chained-task paths still create the row here so
+        # the UI shows the run as queued while the task waits on the
+        # semaphore; once we acquire the slot, flip to "running" and hand
+        # off to _execute_task_locked.
         from core.database import SessionLocal, TaskRun
         current = asyncio.current_task()
         if current:
             self._task_handles[task_id] = current
-        run_id = str(uuid.uuid4())
-        _q_db = SessionLocal()
-        try:
-            run = TaskRun(
-                id=run_id,
-                task_id=task_id,
-                started_at=_utcnow(),
-                status="queued",
-                result="Queued — waiting for a free slot…",
-            )
-            _q_db.add(run)
-            _q_db.commit()
-        except Exception:
-            logger.exception(f"Failed to create queued run row for task {task_id}")
-        finally:
-            _q_db.close()
+        if run_id is None:
+            run_id = self._create_run_record(task_id)
 
         try:
             if bypass_model_slot or not self._task_needs_model_slot(task_id):
@@ -877,6 +894,33 @@ class TaskScheduler:
             if release_executing:
                 async with self._executing_guard():
                     self._executing.discard(task_id)
+
+    def _create_run_record(self, task_id: str) -> str | None:
+        """Synchronously insert a queued ``TaskRun`` row and return its id.
+
+        Returns ``None`` when the row could not be written — callers treat
+        this as a soft failure and dispatch the task without a row so the
+        user can still trigger the task even under DB contention.
+        """
+        from core.database import SessionLocal, TaskRun
+        run_id = str(uuid.uuid4())
+        db = SessionLocal()
+        try:
+            run = TaskRun(
+                id=run_id,
+                task_id=task_id,
+                started_at=_utcnow(),
+                status="queued",
+                result="Queued — waiting for a free slot…",
+            )
+            db.add(run)
+            db.commit()
+            return run_id
+        except Exception:
+            logger.exception(f"Failed to create queued run row for task {task_id}")
+            return None
+        finally:
+            db.close()
 
     def _defer_immediately_due_task(self, task_id: str, *, delay: timedelta):
         """A queued task can be cancelled before _execute_task_locked gets a DB
@@ -1726,7 +1770,88 @@ class TaskScheduler:
             from src.tool_index import get_tool_index, ASSISTANT_ALWAYS_AVAILABLE
             tool_idx = get_tool_index()
             if tool_idx:
-                rag_tools = tool_idx.get_tools_for_query(task.prompt or "", k=8)
+                # Reindex MCP tools so the RAG lane sees servers/tools that
+                # were registered after the last foreground chat. The agent
+                # loop path does this implicitly (see agent_loop.py near
+                # ``index_mcp_tools``); the background task path is the only
+                # one that omits it, so a fresh container that triggers a
+                # scheduled task before anyone chats will see zero MCP tools
+                # in ``relevant_tools``.
+                try:
+                    from src.mcp_manager import get_mcp_manager
+                    mcp_mgr = get_mcp_manager()
+                    if mcp_mgr is not None:
+                        # The indexing call hits ChromaDB and can stall on a
+                        # cold remote endpoint, so offload it to a worker
+                        # thread and bound the wait. Failures are tolerated
+                        # the same way the existing block does — we fall back
+                        # to the previously-indexed MCP set, which is at
+                        # worst the same behavior as before this fix.
+                        await asyncio.wait_for(
+                            asyncio.to_thread(tool_idx.index_mcp_tools, mcp_mgr),
+                            timeout=1.5,
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[assistant] MCP tool indexing exceeded %.1fs; continuing without reindex",
+                        1.5,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[assistant] MCP tool indexing failed: %s", exc,
+                    )
+                # Crew-enrolled MCP qualified names (the OXS bridge tools
+                # the crew's ``enabled_tools`` allows) are excluded from the
+                # builtin ``disabled_tools`` filter (BUILTIN_TOOL_DESCRIPTIONS
+                # does not contain ``mcp__*``), but they also don't survive
+                # the RAG top-k=8 against ~89 builtin + 31 always-available
+                # entries unless the prompt literally names them. Force-
+                # include the qualified names so the agent loop sees the
+                # bridge tools the operator explicitly wired up.
+                always_include: set[str] = set()
+                if crew and getattr(crew, "enabled_tools", None):
+                    try:
+                        enabled_raw = crew.enabled_tools
+                        enabled = (
+                            json.loads(enabled_raw)
+                            if isinstance(enabled_raw, str)
+                            else list(enabled_raw or [])
+                        )
+                        if isinstance(enabled, list):
+                            always_include = {
+                                t for t in enabled
+                                if isinstance(t, str) and t.startswith("mcp__")
+                            }
+                    except Exception:
+                        always_include = set()
+                if always_include:
+                    # ``stream_agent_loop`` nulls the McpManager for any owner
+                    # that fails ``blocked_tools_for_owner`` (public/non-admin
+                    # policy), which silently drops EVERY ``mcp__*`` schema —
+                    # including the ones the crew explicitly allowlisted here.
+                    # The result is a permanent ``selected_not_offered`` audit
+                    # entry and an agent that answers "that tool is not exposed
+                    # in this session". Surface the real cause instead of
+                    # blaming the McpManager cache.
+                    try:
+                        from src.tool_security import blocked_tools_for_owner
+                        _owner_blocked = blocked_tools_for_owner(task.owner)
+                    except Exception:
+                        _owner_blocked = set()
+                    if _owner_blocked:
+                        logger.error(
+                            "[assistant] task '%s' (owner=%r) allowlists %d MCP "
+                            "tool(s) but the owner is not an admin: every "
+                            "mcp__* schema will be hidden from the agent. Set "
+                            "the task's owner to an admin user (or disable "
+                            "auth) so the bridge tools can be offered.",
+                            task.name, task.owner, len(always_include),
+                        )
+
+                rag_tools = tool_idx.get_tools_for_query(
+                    task.prompt or "", k=8,
+                    always_include=always_include or None,
+                )
                 relevant_tools = compose_task_relevant_tools(
                     rag_tools, ASSISTANT_ALWAYS_AVAILABLE, disabled_tools
                 )
@@ -1960,7 +2085,12 @@ class TaskScheduler:
         from src.agent_runtime.authority import restore_task_authority
 
         system_content = system_prompt or "You are a helpful assistant executing a scheduled task. Use available tools to complete the task thoroughly."
-        user_content = override_user_message or task.prompt
+        # Expand fire-time placeholders on every execution, not just at
+        # reconcile. A cron task's stored prompt outlives the moment it was
+        # written, so a frozen ``{since_ts}`` would drift older every tick.
+        user_content = _expand_live_prompt_placeholders(
+            override_user_message or task.prompt or ""
+        )
         # Build the message list. The datetime context message (user-role) is
         # inserted immediately before the task prompt so the system prefix stays
         # byte-identical and cacheable across runs (see issue #2927).
@@ -2381,17 +2511,38 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"Task {task.id} MCP delivery failed: {e}")
 
-    async def run_task_now(self, task_id: str, *, force: bool = False):
-        """Manually trigger a task execution."""
+    def run_task_now(self, task_id: str, *, force: bool = False) -> str | None:
+        """Manually trigger a task execution.
+
+        Returns the ``TaskRun.id`` of the queued run when the trigger is
+        accepted, or ``None`` when the task is already in flight (for
+        non-force triggers) or when the queued row could not be written.
+        Synchronous so callers can capture the run id without having to
+        unwrap a coroutine, and so the contract is uniform across sync
+        and async call sites.
+        """
         if force:
-            asyncio.create_task(self._execute_task(task_id, bypass_model_slot=True, release_executing=False))
-            return True
-        async with self._executing_guard():
+            run_id = self._create_run_record(task_id)
+            if run_id is None:
+                return None
+            asyncio.create_task(self._execute_task(
+                task_id,
+                run_id=run_id,
+                bypass_model_slot=True,
+                release_executing=False,
+            ))
+            return run_id
+        with self._executing_lock:
             if task_id in self._executing:
-                return False
+                return None
             self._executing.add(task_id)
-        asyncio.create_task(self._execute_task(task_id))
-        return True
+        run_id = self._create_run_record(task_id)
+        if run_id is None:
+            with self._executing_lock:
+                self._executing.discard(task_id)
+            return None
+        asyncio.create_task(self._execute_task(task_id, run_id=run_id))
+        return run_id
 
     async def stop_task(self, task_id: str) -> bool:
         """Request cancellation of a running/queued task and mark its run aborted."""

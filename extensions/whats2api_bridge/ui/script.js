@@ -12,7 +12,7 @@
     // version while the old document was still mounted, this code
     // sees the mismatched version marker and forces a clean reload.
     (function() {
-      const expected = "w2a v0.4.0";
+      const expected = "w2a v0.5.0";
       const here = (document.body && document.body.innerHTML) || "";
       if (!here.includes(expected)) {
         // Append a hard reload that fires after paint so the user sees
@@ -495,4 +495,324 @@
     loadConfig();
     refreshBrowser();
     loadMcp();
+    loadAnalyzer();
+    loadAnalyzerRuns();
+
+    // ── Conversation Analyzer ──────────────────────────────────────────
+    // Reads status from GET /analyzer, renders into the section above.
+    // PATCH /analyzer persists form values + triggers reconcile on the
+    // server side (which re-evaluates the ScheduledTask row in the same
+    // call). POST /analyzer/run-now triggers an immediate execution via
+    // the Odysseus task scheduler — useful when the operator wants to
+    // see if the prompt behaves without waiting for the next tick.
+    async function loadAnalyzer() {
+      const pill = $("analyzer-pill");
+      const lastEl = $("analyzer-last-run");
+      const nextEl = $("analyzer-next-run");
+      const countEl = $("analyzer-run-count");
+      const epEl = $("analyzer-endpoint");
+      const errEl = $("analyzer-error");
+
+      pill.textContent = "loading…";
+      pill.className = "intg-pill";
+
+      let d = null;
+      let fetchErr = null;
+      try { d = await api("/analyzer"); }
+      catch (e) { fetchErr = e.message || String(e); }
+
+      if (fetchErr) {
+        pill.textContent = "unavailable";
+        pill.className = "intg-pill enabled-off";
+        errEl.textContent = "Couldn't reach /analyzer — " + fetchErr;
+        errEl.style.display = "";
+        return;
+      }
+
+      const s = d.settings || {};
+      const t = d.task;
+      // Cache the server-provided default prompt the first time we see it.
+      if (d && typeof d.default_prompt === "string" && d.default_prompt) {
+        window.__w2a_default_prompt = d.default_prompt;
+      }
+      const on = !!s.enabled && !!t && t.status === "active";
+      pill.textContent = on
+        ? "running every " + (s.interval_minutes || "?") + " min"
+        : (s.enabled ? "paused" : "disabled");
+      pill.className = "intg-pill " + (on ? "enabled-on" : "enabled-off");
+
+      lastEl.textContent = d.last_run || "—";
+      if (!d.last_run) lastEl.classList.add("placeholder");
+      else lastEl.classList.remove("placeholder");
+      nextEl.textContent = d.next_run || "—";
+      if (!d.next_run) nextEl.classList.add("placeholder");
+      else nextEl.classList.remove("placeholder");
+      countEl.textContent = (d.run_count || 0).toString();
+      countEl.classList.remove("placeholder");
+
+      const resolved = d.resolved || ["", ""];
+      const ep = t && t.endpoint_url ? t.endpoint_url : (resolved[0] || "—");
+      const md = t && t.model ? t.model : (resolved[1] || "—");
+      epEl.textContent = `${ep} · ${md}`;
+      epEl.classList.remove("placeholder");
+
+      if (d.ok === false) {
+        errEl.textContent = d.error || "Analyzer could not be reconciled.";
+        errEl.style.display = "";
+      } else {
+        errEl.style.display = "none";
+        errEl.textContent = "";
+      }
+
+      // Patch the form. Only fields the user has not manually changed
+      // are overwritten — prevents the form from clobbering a half-typed
+      // input on a slow refresh.
+      function patchIfUntouched(id, value) {
+        const el = $(id);
+        if (!el || el === document.activeElement) return;
+        if (document.body.dataset["az_touch_" + id] === "1") return;
+        el.value = value == null ? "" : value;
+      }
+      const cb = $("analyzer-enabled");
+      if (cb && cb !== document.activeElement && document.body.dataset.az_touch_analyzer_enabled !== "1") {
+        cb.checked = !!s.enabled;
+      }
+      patchIfUntouched("analyzer-interval", s.interval_minutes);
+      patchIfUntouched("analyzer-lookback",  s.lookback_hours);
+      patchIfUntouched("analyzer-min-msg",   s.min_messages);
+      patchIfUntouched("analyzer-model",     s.model);
+      patchIfUntouched("analyzer-prompt",    s.prompt);
+    }
+
+    ["analyzer-enabled", "analyzer-interval", "analyzer-lookback",
+     "analyzer-min-msg", "analyzer-model", "analyzer-prompt"].forEach(id => {
+      const el = $(id);
+      if (el) el.addEventListener("focus", () => {
+        document.body.dataset["az_touch_" + id] = "1";
+      });
+    });
+
+    // Cache the server-provided default prompt so the "Reset" button can
+    // restore it without a round trip. Kept on `window` to survive the
+    // page-reload cycle (cached for the lifetime of the document).
+    window.__w2a_default_prompt = window.__w2a_default_prompt || null;
+
+    const resetBtn = $("analyzer-reset-prompt");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        const ta = $("analyzer-prompt");
+        const dflt = window.__w2a_default_prompt || (d && d.default_prompt) || "";
+        if (!dflt) {
+          showMsg("Default prompt not yet loaded — refresh once", "err");
+          return;
+        }
+        ta.value = dflt;
+        document.body.dataset.az_touch_analyzer_prompt = "1";
+        showMsg("Default prompt restored (click Save to persist)", "ok");
+      });
+    }
+
+    $("analyzer-save").addEventListener("click", async () => {
+      const status = $("analyzer-status");
+      const btn = $("analyzer-save");
+      btn.disabled = true;
+      status.textContent = "saving…";
+      const body = {
+        enabled: $("analyzer-enabled").checked,
+        interval_minutes: parseInt($("analyzer-interval").value, 10),
+        lookback_hours:   parseInt($("analyzer-lookback").value, 10),
+        min_messages:     parseInt($("analyzer-min-msg").value, 10),
+        model:            $("analyzer-model").value,
+        prompt:           $("analyzer-prompt").value,
+      };
+      try {
+        const r = await api("/analyzer", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (r && r.ok === false) throw new Error(r.error || "save failed");
+        status.textContent = r.ok ? `saved (${r.applied}) ✓` : "saved";
+        showMsg("Analyzer saved", "ok");
+        loadAnalyzer();
+      } catch (e) {
+        status.textContent = "";
+        showMsg("Save failed: " + e.message, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $("analyzer-run-now").addEventListener("click", async () => {
+      const status = $("analyzer-status");
+      const btn = $("analyzer-run-now");
+      btn.disabled = true;
+      status.textContent = "running…";
+      try {
+        const r = await api("/analyzer/run-now", { method: "POST" });
+        if (r && r.ok === false) throw new Error(r.error || "trigger failed");
+        status.textContent = "run triggered ✓";
+        showMsg("Analyzer run triggered", "ok");
+        setTimeout(loadAnalyzer, 1500);
+        setTimeout(loadAnalyzerRuns, 1200);
+      } catch (e) {
+        status.textContent = "";
+        showMsg("Run failed: " + e.message, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // ── Recent runs + per-run detail ────────────────────────────────
+    async function loadAnalyzerRuns() {
+      const list = $("analyzer-runs-list");
+      const detail = $("analyzer-run-detail");
+      if (!list) return;
+      list.textContent = "loading…";
+
+      let d = null;
+      let err = null;
+      try {
+        d = await api("/analyzer/runs?limit=20");
+      } catch (e) {
+        err = e.message || String(e);
+      }
+      if (err) {
+        list.innerHTML = `<span style="color:var(--danger);">Couldn't reach /analyzer/runs — ${escapeHtml(err)}</span>`;
+        if (detail) detail.style.display = "none";
+        return;
+      }
+      if (!d || d.ok === false) {
+        list.innerHTML = `<span style="color:var(--danger);">${escapeHtml(d && d.error || "error")}</span>`;
+        return;
+      }
+      const rows = d.rows || [];
+      if (rows.length === 0) {
+        list.innerHTML = '<span class="placeholder">no runs yet — click ▶ Run scheduler now above</span>';
+        if (detail) detail.style.display = "none";
+        return;
+      }
+      // Stash once so click handlers can resolve session_id without
+      // re-fetching.
+      window.__w2a_analyzer_runs = { rows, session_id: d.session_id || null };
+
+      const head = `
+        <table style="width:100%; border-collapse: collapse; font-size: 11px;">
+          <thead>
+            <tr style="text-align:left; color: var(--fg-dim); border-bottom: 1px solid var(--border);">
+              <th style="padding:4px 6px;">Started</th>
+              <th style="padding:4px 6px;">Status</th>
+              <th style="padding:4px 6px;">Duration</th>
+              <th style="padding:4px 6px;">Tokens</th>
+              <th style="padding:4px 6px;">Preview</th>
+              <th style="padding:4px 6px;"></th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+      const body = rows.map((r) => {
+        const started = r.started_at ? r.started_at.replace("T", " ").slice(0, 19) : "—";
+        const status = r.status || "—";
+        const statusColor =
+          status === "success" ? "var(--accent)" :
+          status === "error" ? "var(--danger)" :
+          status === "running" ? "var(--accent-2)" : "var(--fg-dim)";
+        const dur = r.duration_seconds != null ? `${r.duration_seconds}s` : (status === "running" ? "…" : "—");
+        const tokens = r.tokens_used != null ? r.tokens_used.toLocaleString() : "—";
+        const preview = (r.result_preview || "").replace(/\s+/g, " ").slice(0, 140) || "<i>(no output)</i>";
+        return `
+          <tr style="border-bottom: 1px solid var(--border);">
+            <td style="padding:4px 6px; font-family: var(--mono); color: var(--fg-dim);">${escapeHtml(started)}</td>
+            <td style="padding:4px 6px; color: ${statusColor};">${escapeHtml(status)}</td>
+            <td style="padding:4px 6px;">${escapeHtml(dur)}</td>
+            <td style="padding:4px 6px;">${escapeHtml(tokens)}</td>
+            <td style="padding:4px 6px; color: var(--fg-dim); max-width: 460px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;">${preview}</td>
+            <td style="padding:4px 6px; white-space: nowrap;">
+              <button data-run-detail="${escapeHtml(r.id)}" style="padding: 2px 8px; font-size: 11px;">Details</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
+      const tail = "</tbody></table>";
+      list.innerHTML = head + body + tail;
+
+      // Click handlers — one per "Details" button; one global for "Open chat".
+      list.querySelectorAll("[data-run-detail]").forEach((btn) => {
+        btn.addEventListener("click", () => loadAnalyzerRunDetail(btn.dataset.runDetail));
+      });
+      const chatBtn = $("analyzer-open-chat");
+      if (chatBtn) {
+        chatBtn.onclick = () => {
+          const sid = (window.__w2a_analyzer_runs || {}).session_id;
+          if (!sid) {
+            showMsg("No chat session yet — run the analyzer at least once", "err");
+            return;
+          }
+          // The Odysseus SPA renders chats at #/chat/<session_id>; navigate
+          // by setting location.hash (works regardless of how the SPA is
+          // mounted — parent iframe, full-page, etc).
+          try {
+            window.parent.location.hash = `/chat/${sid}`;
+          } catch (_) {
+            window.location.hash = `/chat/${sid}`;
+          }
+        };
+      }
+
+      // Open-chat row at the top of the table (only when a session is bound).
+      if (d.session_id) {
+        const headerRow = list.querySelector("thead tr");
+        if (headerRow && !$("analyzer-open-chat")) {
+          const th = document.createElement("th");
+          th.colSpan = 6;
+          th.style.cssText = "padding:6px; border-bottom:1px solid var(--border); text-align:right;";
+          th.innerHTML = '<button id="analyzer-open-chat" style="padding:2px 10px;font-size:11px;">Open chat session →</button>';
+          headerRow.appendChild(th);
+          // Re-bind after injecting.
+          th.querySelector("#analyzer-open-chat").onclick = () => {
+            try { window.parent.location.hash = `/chat/${d.session_id}`; }
+            catch (_) { window.location.hash = `/chat/${d.session_id}`; }
+          };
+        }
+      }
+    }
+
+    async function loadAnalyzerRunDetail(runId) {
+      const detail = $("analyzer-run-detail");
+      if (!detail) return;
+      detail.style.display = "block";
+      detail.textContent = "loading…";
+      let d = null;
+      let err = null;
+      try {
+        d = await api(`/analyzer/runs/${encodeURIComponent(runId)}`);
+      } catch (e) {
+        err = e.message || String(e);
+      }
+      if (err) {
+        detail.textContent = `error: ${err}`;
+        return;
+      }
+      if (!d || d.ok === false) {
+        detail.textContent = `error: ${(d && d.error) || "unknown"}`;
+        return;
+      }
+      const r = d.run;
+      const head = [
+        `Run:     ${r.id}`,
+        `Started: ${r.started_at || "—"}`,
+        `Finished:${r.finished_at || "—"}`,
+        `Status:  ${r.status}    Duration: ${r.duration_seconds != null ? r.duration_seconds + "s" : "—"}    Tokens: ${r.tokens_used != null ? r.tokens_used : "—"}    Model: ${r.model || "—"}`,
+        `Result length: ${r.result_length || 0} chars${r.result_truncated ? " (truncated for display; full result is in chat session)" : ""}`,
+        r.error ? `Error: ${r.error}` : "",
+        "─".repeat(60),
+        "",
+      ].filter(Boolean).join("\n");
+      detail.textContent = head + (r.result || "(empty)");
+    }
+
+    const refreshRunsBtn = $("analyzer-refresh-runs");
+    if (refreshRunsBtn) {
+      refreshRunsBtn.addEventListener("click", () => loadAnalyzerRuns());
+    }
   

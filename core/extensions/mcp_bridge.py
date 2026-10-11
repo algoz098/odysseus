@@ -51,13 +51,19 @@ def install_tools(
     count = 0
     for reg in registrations:
         qualified_name = f"oxs.{extension_id}.{reg.tool_name}"
+        # Prefer the semantic description when the extension supplied one —
+        # ``tool_index`` RAG ranks MCP tools by these strings, so a useful
+        # description matters for retrieval. Fall back to the legacy
+        # ``"[<ext_id>] <name>"`` placeholder for backward compatibility.
+        description = reg.description_rich or f"[{extension_id}] {reg.tool_name}"
         try:
             manager.register_in_process_tool(
                 server_id=server_id,
                 tool_name=reg.tool_name,
                 input_schema=reg.schema or {"type": "object", "properties": {}},
-                description=f"[{extension_id}] {reg.tool_name}",
+                description=description,
                 handler=reg.handler,
+                read_only=bool(getattr(reg, "read_only", False)),
             )
             count += 1
         except Exception:

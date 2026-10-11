@@ -113,6 +113,17 @@ class MCPToolRegistration:
     tool_name: str
     schema: dict
     handler: Callable
+    # Optional rich description — semantic text used both in the OpenAI tool
+    # list and for the ``tool_index`` RAG pass. When omitted the bridge
+    # falls back to ``"[<ext_id>] <tool_name>"`` (preserved for backward
+    # compatibility).
+    description_rich: str | None = None
+    # Declare the tool to the capability/approval gate as a brokered private
+    # read. Without this the gate treats an OXS tool as unknown and refuses
+    # the call once any untrusted context has been seen (which the tool's own
+    # catalog injection guarantees). Results are still treated as untrusted
+    # external data either way. Default False keeps unknown tools failing high.
+    read_only: bool = False
 
 
 @dataclass
@@ -377,10 +388,14 @@ class OXSHost:
     @require_capability("mcp_tools")
     def register_mcp_tool(
         self, server_name: str, tool_name: str, schema: dict, handler: Callable,
+        description_rich: str | None = None,
+        read_only: bool = False,
     ) -> None:
         self.mcp_tools.append(MCPToolRegistration(
             server_name=server_name, tool_name=tool_name,
             schema=schema, handler=handler,
+            description_rich=description_rich,
+            read_only=read_only,
         ))
 
     @require_capability("routes")
