@@ -101,8 +101,12 @@ ANALYZER_ALLOWED_TOOLS: tuple[str, ...] = (
     "manage_tasks",
     "manage_calendar",
     "manage_memory",
-    # Planning / scratchpad:
-    "todowrite",
+    # NOTE: "todowrite" is deliberately NOT here. It is WRITE_PRIVATE
+    # with no authority grant from the analyzer prompt, so after the
+    # untrusted WhatsApp context the post-external gate demands an
+    # interactive approval a scheduled task cannot give — the run dies
+    # with "paused safely" and no findings. Persistence goes through
+    # the manage_* tools above, which the prompt does grant.
     # Local cache of the bridge — accessed via the qualified MCP
     # names. Listed here for documentation; the scheduler's
     # ``disabled_tools`` filter does not key on these. They get
