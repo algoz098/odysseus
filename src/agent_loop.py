@@ -4601,6 +4601,70 @@ def _notes_general_definition_answer(text: str) -> Optional[str]:
     return None
 
 
+# App tool identifiers whose presence, in bulk, marks a text as an instruction
+# prompt rather than an end-user request. MCP-qualified names
+# (``mcp__oxs_bridge__list_messages``) are matched on their final segment.
+_APP_TOOL_TOKENS = frozenset({
+    "manage_bg_jobs",
+    "manage_calendar",
+    "manage_contact",
+    "manage_documents",
+    "manage_email_state",
+    "manage_endpoints",
+    "manage_mcp",
+    "manage_memory",
+    "manage_notes",
+    "manage_research",
+    "manage_sessions",
+    "manage_settings",
+    "manage_skills",
+    "manage_tasks",
+    "manage_tokens",
+    "manage_webhooks",
+    "search_chats",
+    "list_messages",
+    "get_message",
+    "list_events",
+    "todowrite",
+    "ask_teacher",
+    "chat_with_model",
+})
+
+_APP_TOOL_TOKEN_RE = re.compile(
+    r"(?<![0-9a-z_])(" + "|".join(sorted(_APP_TOOL_TOKENS)) + r")(?![0-9a-z_])"
+)
+
+_MCP_QUALIFIED_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]*(?:__[A-Za-z0-9][A-Za-z0-9_]*)+")
+
+
+def _manifest_tool_tokens(value: str) -> set[str]:
+    """Distinct app tool identifiers named by a text, prefix-stripped."""
+    lowered = value.lower()
+    # MCP-qualified names (``mcp__oxs_bridge__list_messages``) carry the tool in
+    # their final ``__`` segment, so reduce them before token matching.
+    unqualified = _MCP_QUALIFIED_RE.sub(lambda m: m.group(0).rsplit("__", 1)[-1], lowered)
+    return set(_APP_TOOL_TOKEN_RE.findall(unqualified))
+
+
+def _is_tool_manifest_prompt(text: str) -> bool:
+    """Recognize a system/extension prompt that documents app tools.
+
+    Scheduled-task and extension prompts are not end-user requests: they name
+    app tools in order to *instruct* an agent. The explicit-intent normalizers
+    match on ordinary words, so a manifest that merely lists tools reads as an
+    ask. A WhatsApp-analyzer prompt naming ``manage_memory`` while describing
+    "recent" conversations and a `memory:` output row matched the memory lookup
+    grammar and produced ``manage_memory list`` every round: the loop overwrote
+    the model's real answer, re-ran identical tool results until it forced a
+    final answer with no tools, and the run ended on the evidence-gate
+    disclosure instead of the model's text.
+    """
+    value = str(text or "")
+    if len(value) > 20000:
+        return True
+    return len(_manifest_tool_tokens(value)) >= 2
+
+
 def _is_personal_tool_definition_turn(text: str) -> bool:
     """Recognize definitions that mention app nouns without requesting app data."""
     q = re.sub(r"\s+", " ", str(text or "").lower()).strip()
@@ -28420,7 +28484,12 @@ async def stream_agent_loop(
         _explicit_private_browser_inspection = _parse_explicit_private_browser_inspection(_last_user)
         _explicit_teacher_request = _parse_explicit_teacher_request(_last_user)
         _explicit_theme_change_request = _parse_explicit_theme_change_request(_last_user)
-        if (
+        _tool_manifest_prompt = _is_tool_manifest_prompt(_last_user)
+        if _tool_manifest_prompt:
+            logger.info(
+                "[agent-intent] skipped explicit tool normalization for tool-manifest prompt"
+            )
+        elif (
             _explicit_private_browser_inspection
             and "private_browser" not in disabled_tools
         ):

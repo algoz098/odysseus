@@ -216,14 +216,25 @@ def _stream_timeout(read_timeout) -> httpx.Timeout:
     return httpx.Timeout(connect=LLMConfig.CONNECT_TIMEOUT, read=float(read_timeout), write=30.0, pool=5.0)
 
 
+# First-SSE-event budget for hosted providers.  Generous enough for a
+# reasoning model that thinks before its first chunk, tight enough that one
+# silent upstream cannot pin a scheduled run open for an hour.
+_FIRST_TOKEN_TIMEOUT_HOSTED_S = 180.0
+
+
 def _first_token_timeout(url: str, stream_timeout: int) -> float:
     """Return a bounded first-event budget for local streaming endpoints.
 
     A provider can accept a request with HTTP 200 and then never emit an SSE
-    event.  The normal read timeout is intentionally generous for slow tokens,
-    but that makes this particular failure look like a hung agent.  Keep the
-    watchdog local-only and configurable so hosted providers retain their
-    existing behavior.
+    event.  The read timeout is an *inactivity* timeout, so an upstream that
+    dribbles a byte every few minutes never trips it and the round -- and with
+    it the whole scheduled run -- stays ``running`` for as long as the socket
+    lives.  A real analyzer run was held 51 minutes that way (988s on the
+    primary, then a 1990s stall on the fallback provider).
+
+    Bound the first event for every endpoint, not just local ones.  Hosted
+    reasoning models legitimately think for a while before the first SSE
+    event, so the default is generous and always clamped by ``stream_timeout``.
     """
     raw = os.getenv("ODYSSEUS_FIRST_TOKEN_TIMEOUT", "").strip()
     if raw:
@@ -234,7 +245,7 @@ def _first_token_timeout(url: str, stream_timeout: int) -> float:
         return max(0.0, min(value, float(stream_timeout)))
     if _is_managed_stream_endpoint(url):
         return min(60.0, float(stream_timeout))
-    return 0.0
+    return min(_FIRST_TOKEN_TIMEOUT_HOSTED_S, float(stream_timeout))
 
 
 # Cache for LLM responses
