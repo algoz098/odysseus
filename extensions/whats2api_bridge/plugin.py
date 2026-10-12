@@ -237,24 +237,175 @@ def _err(message: str, **extra: Any) -> dict:
 
 
 # ── HTTP client builder ────────────────────────────────────────────────────
+#
+# whats2api has two *different* credentials, and conflating them is the
+# single biggest thing to understand about this client:
+#
+#   1. A long-lived **MCP token** (dashboard → /p/mcp-tokens). Used as
+#      ``Authorization: Bearer`` for the MCP surface, and embedded in the
+#      server URL ``https://api.whats2api.com/mcp/<token>``.
+#   2. A **daily JWT**, minted by ``POST /authentication`` with the
+#      account email + password. It is what the REST surface
+#      (``GET /connections``, ``POST /connections/request``) checks.
+#
+# Handing the REST surface the MCP token yields
+# ``401 {"message": "jwt malformed", "className": "JsonWebTokenError"}``
+# — verified against the live API with a real credential, which is the
+# only way to find it: the token is perfectly valid, just on the other
+# door. So the client prefers a JWT when it can mint one, and falls back
+# to the stored token only when it cannot.
+
+# Refresh a little before the documented 1-day life so a long-running
+# analyzer does not discover expiry mid-turn.
+_JWT_TTL_SECONDS = 20 * 3600
+_JWT_CACHE: dict = {"token": "", "at": 0.0}
+_JWT_LOCK = None
+
+
+def _rest_credentials(host) -> tuple:
+    """``(email, password)`` for the daily-JWT flow, or ``(None, None)``."""
+    return (
+        str(_s(host, "api_email", "") or "").strip(),
+        str(_s(host, "api_password", "") or ""),
+    )
+
+
+def _jwt_cached() -> str:
+    cached = _JWT_CACHE.get("token") or ""
+    if cached and time.time() < (_JWT_CACHE.get("at") or 0.0):
+        return cached
+    return ""
+
+
+async def _mint_jwt(host) -> str:
+    """Exchange email+password for a fresh access token.
+
+    Raises on anything the provider rejects, so the caller can report the
+    real reason instead of a downstream 401 with no explanation.
+    """
+    email, password = _rest_credentials(host)
+    if not (email and password):
+        raise RuntimeError(
+            "whats2api_bridge: api_email/api_password are not configured. "
+            "The REST API requires a daily JWT from POST /authentication; "
+            "the MCP token alone is rejected with 'jwt malformed'. Set both "
+            "in Settings → Extensions → Whats2API Bridge."
+        )
+    base = str(_s(host, "base_url", DEFAULT_BASE_URL)).rstrip("/")
+    timeout = float(_s(host, "request_timeout_seconds", 30))
+    async with httpx.AsyncClient(base_url=base, timeout=timeout) as client:
+        response = await client.post(
+            "/authentication",
+            json={"email": email, "password": password, "strategy": "local"},
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json"},
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"whats2api rejected the login (HTTP {response.status_code}): "
+            f"{response.text[:200]}"
+        )
+    try:
+        token = (response.json() or {}).get("accessToken")
+    except Exception as exc:
+        raise RuntimeError(
+            f"whats2api login returned no accessToken: {exc}"
+        ) from exc
+    if not token:
+        raise RuntimeError("whats2api login returned an empty accessToken")
+    _JWT_CACHE["token"] = str(token)
+    _JWT_CACHE["at"] = time.time() + _JWT_TTL_SECONDS
+    return str(token)
+
+
+async def _rest_token(host, *, force_refresh: bool = False) -> str:
+    """The bearer to put on a REST call."""
+    email, password = _rest_credentials(host)
+    if not (email and password):
+        # No account credentials: fall back to whatever token is stored.
+        # Kept so a misconfigured install fails the way it always did
+        # rather than erroring differently from a different cause.
+        return str(_s(host, "api_token", "") or "")
+    if not force_refresh:
+        cached = _jwt_cached()
+        if cached:
+            return cached
+    return await _mint_jwt(host)
+
+
+def _is_auth_failure(status_code: int, body: str = "") -> bool:
+    """Whether a response means "your bearer is not valid", not "bad call"."""
+    if status_code in (401, 403):
+        return True
+    lowered = (body or "").lower()
+    return "jwt" in lowered and (
+        "malformed" in lowered or "expired" in lowered or "invalid" in lowered
+    )
 
 
 def _build_client(host) -> httpx.AsyncClient:
+    """Build an unauthenticated client.
+
+    The bearer is attached per call by :func:`_authorized_request`, which
+    is async and may need to mint a JWT first. Building it here would mean
+    either blocking the loop on a network round trip or caching a token
+    that nobody can refresh.
+    """
     base = str(_s(host, "base_url", DEFAULT_BASE_URL)).rstrip("/")
-    token = str(_s(host, "api_token", "") or "")
-    if not token:
-        raise RuntimeError(
-            "whats2api_bridge: api_token is not configured. "
-            "Set it in Settings → Extensions → Whats2API Bridge."
-        )
     timeout = float(_s(host, "request_timeout_seconds", 30))
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "odysseus-whats2api-bridge/0.1.0",
-    }
-    return httpx.AsyncClient(base_url=base, headers=headers, timeout=timeout)
+    return httpx.AsyncClient(
+        base_url=base,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "odysseus-whats2api-bridge/0.5.2",
+        },
+        timeout=timeout,
+    )
+
+
+def _attach_auth(host, client: httpx.AsyncClient) -> None:
+    """Route every request on ``client`` through JWT auth with one retry.
+
+    ``AsyncClient.request`` is the single funnel that ``get``/``post``/
+    ``patch``/``delete`` all call, so wrapping it here covers the whole
+    transport family without touching any handler. The retry is what
+    makes a daily JWT usable at all: a token that expires mid-window
+    refreshes and the call proceeds, instead of every outbound tool
+    failing until a human notices.
+    """
+    inner = client.request
+
+    async def _request(method, url, **kw):
+        headers = dict(kw.pop("headers", None) or {})
+        token = await _rest_token(host)
+        if not token:
+            # Without this the header below becomes the literal "Bearer ",
+            # which httpx rejects as an illegal header value -- an error
+            # that says nothing about the real cause.
+            raise RuntimeError(
+                "whats2api_bridge: no API credential configured. Set "
+                "api_email + api_password in Settings → Extensions → "
+                "Whats2API Bridge; the REST API needs the daily JWT from "
+                "POST /authentication and rejects an MCP token with "
+                "'jwt malformed'."
+            )
+        headers["Authorization"] = f"Bearer {token}"
+        response = await inner(method, url, headers=headers, **kw)
+        if not _is_auth_failure(response.status_code, response.text[:300]):
+            return response
+        if not all(_rest_credentials(host)):
+            # Nothing better to try; let the provider's own answer stand.
+            response.raise_for_status()
+            return response
+        headers["Authorization"] = f"Bearer {await _mint_jwt(host)}"
+        logger.info(
+            "whats2api bearer rejected (%s); refreshed and retrying once",
+            response.status_code,
+        )
+        return await inner(method, url, headers=headers, **kw)
+
+    client.request = _request
 
 
 # ── Defensive defaults + MCP integrations registry ─────────────────────────
@@ -269,6 +420,11 @@ _ALLOWED_USER_SETTINGS = (
     "retention_days",
     "log_inbound_events",
 )
+
+# Write-only credentials. Listed here rather than in the readable settings
+# view so the admin GET never echoes a password back over the wire; the UI
+# shows only whether one is set.
+_CREDENTIAL_SETTINGS = ("api_token", "api_email", "api_password")
 
 
 def _ensure_settings(host) -> None:
@@ -358,6 +514,7 @@ def _make_async_handler(
                 return _err(str(e))
             client = _build_client(host)
             try:
+                _attach_auth(host, client)
                 if needs_connection_id:
                     result = await fn(client, cid, args, host)
                 else:
@@ -1847,6 +2004,7 @@ async def _refresh_connections_cache(host, storage: PluginStorage, hint_connecti
     except RuntimeError:
         return
     try:
+        _attach_auth(host, client)
         r = await client.get("/connections")
         r.raise_for_status()
         data = r.json()
@@ -2151,6 +2309,15 @@ def _admin_config_post(host, storage, body: dict):
     if "api_token" in body:
         # Allow setting OR clearing the token (empty string = clear).
         ns.set("api_token", str(body["api_token"] or ""))
+    if "api_email" in body:
+        ns.set("api_email", str(body["api_email"] or "").strip())
+    if "api_password" in body:
+        # Setting a new password invalidates the cached JWT: it may have
+        # been rotated, and the next call would otherwise keep presenting
+        # a token minted with the old one for up to a day.
+        ns.set("api_password", str(body["api_password"] or ""))
+        _JWT_CACHE["token"] = ""
+        _JWT_CACHE["at"] = 0.0
     if "webhook_url_token" in body:
         # The user-defined path token. Empty string → rotate to a fresh
         # random 32-byte token. Validation enforces URL-safe characters
