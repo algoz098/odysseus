@@ -134,7 +134,11 @@ def test_cancel_keeps_event_loop_responsive_during_database_lock(tmp_path, monke
     from src.task_scheduler import TaskScheduler
 
     holder = sqlite3.connect(tmp_path / 'tasks.db', check_same_thread=False)
-    assert holder.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
+    # The suite pins DELETE journal mode (core/database.py): WAL's shm
+    # index is incoherent over the docker bind mount and external sqlite
+    # processes could truncate the app's committed frames. The lock
+    # scenario below is journal-mode independent.
+    assert holder.execute('PRAGMA journal_mode').fetchone()[0] == 'delete' 
     heartbeat = threading.Event()
     progress_before_release = []
     def release_lock():

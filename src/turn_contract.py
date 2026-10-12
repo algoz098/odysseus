@@ -48,6 +48,7 @@ FAMILY_TOOLS = {
         "mcp__whats2api__mark_read",
         "mcp__whats2api__send_presence",
         "mcp__whats2api__is_on_whatsapp",
+        "mcp__oxs_whats2api_bridge__get_analysis_queue",
         "mcp__oxs_whats2api_bridge__list_messages",
         "mcp__oxs_whats2api_bridge__get_message",
         "mcp__oxs_whats2api_bridge__list_events",

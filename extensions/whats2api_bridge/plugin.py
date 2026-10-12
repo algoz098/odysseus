@@ -112,6 +112,7 @@ ANALYZER_ALLOWED_TOOLS: tuple[str, ...] = (
     # ``disabled_tools`` filter does not key on these. They get
     # registered in the MCP server's namespace and the RAG picks
     # them up when relevant to the analyzer's prompt.
+    "mcp__oxs_whats2api_bridge__get_analysis_queue",
     "mcp__oxs_whats2api_bridge__list_messages",
     "mcp__oxs_whats2api_bridge__get_message",
     "mcp__oxs_whats2api_bridge__list_events",
@@ -144,13 +145,18 @@ operator's recent WhatsApp conversations. You run on a schedule; the operator \
 reviews each run as a normal chat session in folder "Tasks".
 
 ## Scope (every run)
-- **Lookback window**: the last {lookback_hours} hour(s) of messages.
-- **Window floor**: call `mcp__oxs_whats2api_bridge__list_messages` with \
-`"since": {since_ts}` on your FIRST call so you only load messages inside the \
-window. Calling it unfiltered pulls the whole table, which exceeds the model's \
-context budget and forces the same re-read every round. One scoped call is \
-enough — do not call it again unless a specific chat needs a second pass.
-- **Skip chats with fewer than {min_messages} message(s) in the window** — pure noise.
+- **You analyze NEW conversation intervals only.** Your FIRST call must be \
+`mcp__oxs_whats2api_bridge__get_analysis_queue` (once, no arguments). It returns:
+  - `new_intervals` — conversation intervals no run has analyzed yet, with \
+their messages. Extract findings from THESE ONLY.
+  - `done_intervals` — intervals already analyzed, with what was persisted. \
+Those items are final: never recreate, update or extend them.
+- If `new_intervals` is empty, output exactly `No new conversation intervals.` \
+and call **zero** write tools — doing nothing is the correct outcome.
+- **Skip intervals with fewer than {min_messages} message(s)** — pure noise.
+- Use `mcp__oxs_whats2api_bridge__list_messages` with `"since": {since_ts}` or \
+`mcp__oxs_whats2api_bridge__get_message` only to drill into one specific chat \
+when an interval needs more context.
 - **You NEVER reply on WhatsApp.** No side effects. Read, decide, persist as notes/tasks/calendar/memory.
 
 ## Tools to use (priority order)
@@ -167,9 +173,6 @@ Read tools (always allowed):
 - `mcp__oxs_whats2api_bridge__get_message`
 - `mcp__oxs_whats2api_bridge__list_connections_local`
 - `search_chats`
-
-Plan / dump:
-- `todowrite`
 
 ## Hard rules
 1. **NEVER call** `send_message`, `send_reaction`, `send_media`, `mark_read`,
@@ -192,10 +195,12 @@ Findings (chat: <push_name or jid>):
   - event: meeting Thu 15:00 — created
   - note: changed delivery address — saved
   - memory: contact João (11 9 9999-0000) — saved
+  - event: meeting Thu 15:00 — already exists, skipped
 - no action needed
 ```
 
-If the window has nothing actionable, output exactly:
+If the queue is empty, output exactly `No new conversation intervals.`
+If the queue has intervals but nothing is actionable, output exactly:
 `No actionable items in the last {lookback_hours}h.` — and call **zero** write tools.
 
 ## Grouping rule
@@ -297,10 +302,11 @@ def _ensure_settings(host) -> None:
     _set_if_empty("analyzer_interval_minutes", 30)
     _set_if_empty("analyzer_lookback_hours", 24)
     _set_if_empty("analyzer_min_messages", 3)
-    _set_if_empty(
-        "analyzer_prompt",
-        DEFAULT_ANALYZER_PROMPT,
-    )
+    # analyzer_prompt is deliberately NOT seeded: an empty value means
+    # "use the live DEFAULT_ANALYZER_PROMPT" (see _analyzer_settings), so
+    # prompt improvements ship with upgrades instead of being frozen by a
+    # snapshot written at first enable. A non-empty value is the operator's
+    # own custom prompt and is never overwritten.
 
 
 def _resolve_connection_id(host, args: dict) -> str:
@@ -494,6 +500,133 @@ def _read_tools(host, storage: PluginStorage):
         rows = storage.execute_raw(sql, {})
         return _ok({"connections": rows, "count": len(rows)})
 
+    async def _get_analysis_queue(client, args, host):
+        """Return the analysis queue: unseen conversation intervals plus a
+        report of intervals already analyzed.
+
+        Harness-owned state: the tool claims the intervals it hands out and
+        seals them when the surrounding scheduled run finishes with
+        success (claims of failed/aborted runs are released so the content
+        is offered again). The model never writes this state.
+        """
+        gap = ANALYZER_INTERVAL_GAP_SECONDS
+        try:
+            gap = max(60, min(int(args.get("gap_seconds") or gap), 6 * 3600))
+        except (TypeError, ValueError):
+            pass
+        now = int(time.time())
+        lookback = _coerce_setting_int(
+            _s(host, "analyzer_lookback_hours", 24), 24, 1, 168
+        )
+        since = now - lookback * 3600
+
+        # Transition claims from finished runs BEFORE computing the queue,
+        # so this run sees exactly what previous runs really completed.
+        runs = []
+        try:
+            from core.database import SessionLocal as _SL
+            from core.database import ScheduledTask as _ST
+            from core.database import TaskRun as _TR
+            db = _SL()
+            try:
+                task = db.query(_ST).filter(_ST.name == ANALYZER_TASK_NAME).first()
+                if task is not None:
+                    for r in (
+                        db.query(_TR).filter(_TR.task_id == task.id)
+                        .order_by(_TR.started_at.desc())
+                        .limit(20)
+                    ):
+                        runs.append({
+                            "id": r.id,
+                            "started_at": _epoch(r.started_at),
+                            "finished_at": _epoch(r.finished_at) if r.finished_at else None,
+                            "status": r.status,
+                            "result": r.result,
+                        })
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("whats2api_bridge: analysis_queue run lookup failed")
+
+        try:
+            _adopt_existing_intervals(storage, now=now, gap_seconds=gap)
+        except Exception:
+            logger.exception("whats2api_bridge: interval adoption failed")
+
+        claimed_rows = [
+            r for r in _load_interval_rows(storage)
+            if (r.get("status") or "") == "claimed"
+        ]
+        try:
+            decisions = seal_claims(claimed_rows, runs, now=now)
+            _apply_seal_decisions(storage, decisions)
+        except Exception:
+            logger.exception("whats2api_bridge: interval seal/release failed")
+
+        covered_rows = [
+            r for r in _load_interval_rows(storage)
+            if (r.get("status") or "") in ("analyzed", "claimed")
+        ]
+        msgs = _fetch_window_messages(storage, since)
+        new_intervals, done = compute_analysis_queue(
+            msgs, covered_rows, now=now, gap_seconds=gap
+        )
+
+        logger.info(
+            "whats2api_bridge: analysis_queue args=%s gap=%s since=%s "
+            "msgs=%s covered=%s new=%s",
+            sorted((args or {}).keys()), gap, since,
+            len(msgs), len(covered_rows), len(new_intervals),
+        )
+        trimmed = []
+        for iv in new_intervals[:_ANALYZER_QUEUE_MAX_INTERVALS]:
+            iv = dict(iv)
+            msgs_cut = iv["messages"][:_ANALYZER_QUEUE_MAX_MSGS]
+            iv["truncated"] = len(iv["messages"]) > len(msgs_cut)
+            iv["messages"] = [
+                {
+                    "id": m.get("id"),
+                    "ts": m.get("ts"),
+                    "push_name": m.get("push_name"),
+                    "sender_jid": m.get("sender_jid"),
+                    "text": str(m.get("text") or "")[:_ANALYZER_MSG_TEXT_CHARS],
+                }
+                for m in msgs_cut
+            ]
+            trimmed.append(iv)
+        try:
+            _claim_intervals(storage, trimmed, now=now)
+        except Exception:
+            logger.exception("whats2api_bridge: interval claim failed")
+
+        done_report = [
+            {
+                "chat_jid": r.get("chat_jid"),
+                "start_ts": r.get("start_ts"),
+                "end_ts": r.get("end_ts"),
+                "findings_summary": r.get("findings_summary"),
+                "analyzed_at": r.get("analyzed_at"),
+            }
+            for r in sorted(
+                done,
+                key=lambda r: (r.get("chat_jid") or "", int(r.get("start_ts") or 0)),
+            )
+        ]
+        return _ok({
+            "since_ts": since,
+            "gap_seconds": gap,
+            "new_intervals": trimmed,
+            "new_interval_count": len(trimmed),
+            "overflow_intervals": max(0, len(new_intervals) - len(trimmed)),
+            "done_intervals": done_report,
+            "done_interval_count": len(done_report),
+            "note": (
+                "Analyze new_intervals only; persist findings for them. "
+                "done_intervals are already persisted - never recreate those "
+                "items. If new_intervals is empty there is nothing to do."
+            ),
+        })
+
     return [
         (
             "list_messages",
@@ -530,6 +663,29 @@ def _read_tools(host, storage: PluginStorage):
             "messages.upsert fan-out). Returns the normalized text plus "
             "the raw Baileys payload. Read-only — does not trigger any "
             "WhatsApp outbound call.",
+        ),
+        (
+            "get_analysis_queue",
+            {
+                "type": "object",
+                "properties": {
+                    "gap_seconds": {
+                        "type": "integer",
+                        "description": "silence gap that splits conversation "
+                        "intervals (default 2700 = 45 min)",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            _make_async_handler(host, _get_analysis_queue, needs_connection_id=False),
+            "Analysis queue for periodic conversation review. Call FIRST, "
+            "once per run. Returns new_intervals: conversation intervals "
+            "(per chat, split on silent gaps) that no run has analyzed yet, "
+            "with their messages inline; and done_intervals: intervals "
+            "already analyzed, with what was persisted - never recreate "
+            "those. Empty new_intervals means nothing to do this run. The "
+            "harness owns the analyzed/claimed state; the caller never "
+            "writes it.",
         ),
         (
             "list_events",
@@ -1792,6 +1948,251 @@ def _coerce_setting_int(value, default: int, lo: int, hi: int) -> int:
     return max(lo, min(n, hi))
 
 
+# ── Conversation-interval analysis queue ───────────────────────────────────
+#
+# The analyzer job re-runs every N minutes over a rolling window. Feeding
+# the same raw messages to every run makes duplication the predictable
+# outcome (the model has no memory of prior runs). Instead the harness
+# partitions the window into conversation intervals (per chat, split on
+# silent gaps), keeps state about which intervals were already analyzed,
+# and hands the model only the unseen ones plus a report of what was done
+# before. "Do nothing" is then a normal, correct outcome.
+
+ANALYZER_INTERVAL_GAP_SECONDS = 45 * 60
+_ANALYZER_CLAIM_TTL_SECONDS = 2 * 3600
+_ANALYZER_RUN_SLACK_SECONDS = 120
+_ANALYZER_QUEUE_MAX_INTERVALS = 10
+_ANALYZER_QUEUE_MAX_MSGS = 40
+_ANALYZER_MSG_TEXT_CHARS = 500
+
+
+def _interval_id(chat_jid: str, start_ts: int, end_ts: int) -> str:
+    return hashlib.sha1(f"{chat_jid}|{start_ts}|{end_ts}".encode()).hexdigest()[:16]
+
+
+def _msg_ts(m) -> int:
+    try:
+        return int(m.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def compute_analysis_queue(messages, analyzed_rows, *, now,
+                           gap_seconds=ANALYZER_INTERVAL_GAP_SECONDS):
+    """Partition messages into sealed, unanalyzed conversation intervals.
+
+    Pure function — the harness state layer feeds ``analyzed_rows`` in and
+    gets determinism back:
+
+    - a message is *covered* when its ts falls inside an already claimed or
+      analyzed range of the same chat (late arrivals into an old interval
+      are therefore never reprocessed);
+    - the survivors are grouped per chat and split on silent gaps of
+      ``gap_seconds``;
+    - only *sealed* groups are returned: quiet for a full gap, so they
+      cannot grow underneath the model while it reasons about them.
+
+    Returns ``(new_intervals, done_intervals)``. Each new interval carries
+    its messages inline and a stable ``id``.
+    """
+    def covered(chat, ts):
+        return any(
+            (r.get("chat_jid") or "") == chat
+            and int(r.get("start_ts") or 0) <= ts <= int(r.get("end_ts") or 0)
+            for r in analyzed_rows
+        )
+
+    by_chat = {}
+    for m in messages:
+        chat = m.get("chat_jid") or ""
+        ts = _msg_ts(m)
+        if covered(chat, ts):
+            continue
+        by_chat.setdefault(chat, []).append(m)
+
+    new_intervals = []
+    for chat in sorted(by_chat):
+        msgs = sorted(by_chat[chat], key=_msg_ts)
+        groups, cur = [], [msgs[0]]
+        for prev, msg in zip(msgs, msgs[1:]):
+            if _msg_ts(msg) - _msg_ts(prev) >= gap_seconds:
+                groups.append(cur)
+                cur = [msg]
+            else:
+                cur.append(msg)
+        groups.append(cur)
+        for g in groups:
+            start_ts, end_ts = _msg_ts(g[0]), _msg_ts(g[-1])
+            if now - end_ts < gap_seconds:
+                continue  # not sealed yet
+            new_intervals.append({
+                "id": _interval_id(chat, start_ts, end_ts),
+                "chat_jid": chat,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "msg_count": len(g),
+                "messages": g,
+            })
+    return new_intervals, list(analyzed_rows)
+
+
+def seal_claims(claim_rows, runs, *, now,
+                ttl_seconds=_ANALYZER_CLAIM_TTL_SECONDS):
+    """Decide what happens to claimed intervals once runs have finished.
+
+    ``runs`` items are ``{id, started_at, finished_at, status, result}``
+    with epoch seconds (``finished_at`` may be ``None`` while in flight):
+
+    - a claim made during a run that later finished ``success`` is sealed
+      (the interval is analyzed; the run's result becomes its summary);
+    - a claim whose run finished without success is released so the
+      interval re-enters the queue — no silent loss on failure;
+    - a claim older than ``ttl_seconds`` is released the same way (crash
+      safety: a run that never came back cannot black-hole content);
+    - anything else is kept (the run is still executing).
+    """
+    decisions = {"seal": [], "release": [], "keep": []}
+    for row in claim_rows:
+        if (row.get("status") or "") != "claimed":
+            continue
+        try:
+            claimed_at = int(row.get("claimed_at") or 0)
+        except (TypeError, ValueError):
+            claimed_at = 0
+        sealed_by = None
+        finished_after = False
+        for run in runs:
+            try:
+                start = int(run.get("started_at") or 0)
+                fin_raw = run.get("finished_at")
+                fin = int(fin_raw) if fin_raw else None
+            except (TypeError, ValueError):
+                continue
+            if fin is None or fin < claimed_at:
+                continue
+            finished_after = True
+            if (
+                (run.get("status") or "") == "success"
+                and start - _ANALYZER_RUN_SLACK_SECONDS <= claimed_at <= fin
+            ):
+                sealed_by = run
+                break
+        if sealed_by is not None:
+            decisions["seal"].append((row, sealed_by))
+        elif finished_after or claimed_at < now - ttl_seconds:
+            decisions["release"].append(row)
+        else:
+            decisions["keep"].append(row)
+    return decisions
+
+
+def _run_result_excerpt(result) -> str:
+    return (str(result) if result else "").strip()[:600]
+
+
+def _epoch(dt) -> int:
+    if not dt:
+        return 0
+    if isinstance(dt, (int, float)):
+        return int(dt)
+    try:
+        from datetime import timezone as _tz
+        return int(dt.replace(tzinfo=_tz.utc).timestamp())
+    except Exception:
+        return 0
+
+
+def _interval_table(storage) -> str:
+    return storage.table_name("intervals")
+
+
+def _load_interval_rows(storage) -> list:
+    return storage.execute_raw(
+        f"SELECT id, chat_jid, start_ts, end_ts, msg_count, status, "
+        f"claimed_at, analyzed_at, run_id, findings_summary "
+        f"FROM {_interval_table(storage)}",
+        {},
+    )
+
+
+def _fetch_window_messages(storage, since: int, *, limit: int = 2000) -> list:
+    return storage.execute_raw(
+        f"SELECT id, chat_jid, sender_jid, push_name, text, message_type, ts "
+        f"FROM {storage.table_name('messages')} WHERE ts >= :since "
+        f"ORDER BY ts ASC LIMIT {int(limit)}",
+        {"since": int(since)},
+    )
+
+
+def _apply_seal_decisions(storage, decisions) -> None:
+    for row, run in decisions["seal"]:
+        storage.execute_write(
+            f"UPDATE {_interval_table(storage)} SET status='analyzed', "
+            f"analyzed_at=:t, run_id=:rid, findings_summary=:s WHERE id=:id",
+            {
+                "t": int(run.get("finished_at") or 0),
+                "rid": str(run.get("id") or ""),
+                "s": _run_result_excerpt(run.get("result")),
+                "id": row["id"],
+            },
+        )
+    for row in decisions["release"]:
+        storage.execute_write(
+            f"DELETE FROM {_interval_table(storage)} WHERE id=:id",
+            {"id": row["id"]},
+        )
+
+
+def _claim_intervals(storage, intervals, *, now) -> None:
+    for iv in intervals:
+        storage.execute_write(
+            f"INSERT OR REPLACE INTO {_interval_table(storage)} "
+            f"(id, chat_jid, start_ts, end_ts, msg_count, status, claimed_at) "
+            f"VALUES (:id, :chat_jid, :start_ts, :end_ts, :msg_count, "
+            f"'claimed', :claimed_at)",
+            {
+                "id": iv["id"],
+                "chat_jid": iv["chat_jid"],
+                "start_ts": iv["start_ts"],
+                "end_ts": iv["end_ts"],
+                "msg_count": iv["msg_count"],
+                "claimed_at": int(now),
+            },
+        )
+
+
+def _adopt_existing_intervals(storage, *, now,
+                              gap_seconds=ANALYZER_INTERVAL_GAP_SECONDS) -> int:
+    """One-time migration: mark everything already sealed as analyzed.
+
+    Content that predates interval tracking was processed by earlier runs;
+    re-offering it on the first upgraded run would recreate every old
+    finding. Runs only while the state table is empty. Groups that are
+    still unsealed (too recent to be final) stay unadopted — they are
+    genuinely new work.
+    """
+    if _load_interval_rows(storage):
+        return 0
+    msgs = _fetch_window_messages(storage, 0, limit=5000)
+    sealed, _ = compute_analysis_queue(msgs, [], now=now, gap_seconds=gap_seconds)
+    for iv in sealed:
+        storage.execute_write(
+            f"INSERT OR REPLACE INTO {_interval_table(storage)} "
+            f"(id, chat_jid, start_ts, end_ts, msg_count, status, analyzed_at, "
+            f"findings_summary) VALUES (:id, :chat_jid, :start_ts, :end_ts, "
+            f":msg_count, 'analyzed', :t, 'adopted: pre-intervalization content')",
+            {
+                "id": iv["id"],
+                "chat_jid": iv["chat_jid"],
+                "start_ts": iv["start_ts"],
+                "end_ts": iv["end_ts"],
+                "msg_count": iv["msg_count"],
+                "t": int(now),
+            },
+        )
+    return len(sealed)
+
+
 def _analyzer_owner() -> str:
     """Best-effort resolution of the current operator owner.
 
@@ -2220,7 +2621,7 @@ def _analyzer_reconcile(host, db, owner: str | None = None) -> dict:
         }
 
     cron = _analyzer_cron_for(s["interval_minutes"])
-    # Substitute the two documented placeholders. We always do this
+    # Substitute the documented non-live placeholders. We always do this
     # even when the resolved prompt is the DEFAULT_ANALYZER_PROMPT —
     # otherwise a downstream literal ``{min_messages}`` would reach
     # the LLM and confuse it.
@@ -2231,9 +2632,11 @@ def _analyzer_reconcile(host, db, owner: str | None = None) -> dict:
     # lookback window stays fresh across cron ticks instead of freezing
     # the cutoff at reconcile time.
     prompt = s["prompt"].replace(
-        "{lookback_hours}", str(s["lookback_hours"])
+        "{lookback_hours}",  str(s["lookback_hours"])
     ).replace(
-        "{min_messages}",   str(s["min_messages"])
+        "{min_messages}",    str(s["min_messages"])
+    ).replace(
+        "{interval_minutes}", str(s["interval_minutes"])
     )
     crew_id = _analyzer_ensure_crew(db, owner)
 
@@ -2324,7 +2727,7 @@ def _analyzer_status(host, db, owner: str | None = None) -> dict:
         "next_run": None,
         "run_count": 0,
         "default_prompt": DEFAULT_ANALYZER_PROMPT,
-        "placeholders": ["lookback_hours", "min_messages"],
+        "placeholders": ["lookback_hours", "min_messages", "interval_minutes"],
     }
     if task is not None:
         out["task"] = {
@@ -2706,9 +3109,32 @@ def register(host):
                     },
                     "indexes": [["event_name", "received_at"], ["connection_id", "received_at"]],
                 },
+                "intervals": {
+                    "columns": {
+                        "id":               "TEXT PRIMARY KEY",
+                        "chat_jid":         "TEXT NOT NULL",
+                        "start_ts":         "INTEGER NOT NULL",
+                        "end_ts":           "INTEGER NOT NULL",
+                        "msg_count":        "INTEGER NOT NULL",
+                        "status":           "TEXT NOT NULL",
+                        "claimed_at":       "INTEGER",
+                        "analyzed_at":      "INTEGER",
+                        "run_id":           "TEXT",
+                        "findings_summary": "TEXT",
+                    },
+                    "indexes": [["status"], ["chat_jid", "start_ts"]],
+                },
             })
         except Exception:
             logger.exception("whats2api_bridge: data_schema apply failed (continuing)")
+
+        # One-time adoption: content that predates interval tracking must
+        # not be re-offered to the analyzer (it would recreate every old
+        # finding on the first upgraded run).
+        try:
+            _adopt_existing_intervals(storage, now=int(time.time()))
+        except Exception:
+            logger.exception("whats2api_bridge: interval adoption failed")
 
         # ── UI ────────────────────────────────────────────────────────
         # Cache-bust the iframe URL on every enable so the browser

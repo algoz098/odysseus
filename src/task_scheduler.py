@@ -65,6 +65,21 @@ def compose_task_relevant_tools(rag_tools, assistant_always, disabled_tools):
     return tools
 
 
+def _merge_final_answer(full_text: str, final_text_replaced: bool, content) -> tuple[str, bool]:
+    """Fold a ``final_response`` payload into the collected answer text.
+
+    The completion gate may present its sanitized answer as one replacement
+    instead of deltas, so a non-empty ``final_response`` supersedes anything
+    collected so far. An empty one must NOT: some runs emit the real answer
+    and then a tail of empty final_response rounds (thinking-only), and
+    wiping the answer there used to leave the run with no output at all.
+    """
+    text = str(content or "")
+    if text.strip() or not full_text.strip():
+        return text, True
+    return full_text, final_text_replaced
+
+
 # Placeholders an extension may leave in a stored task prompt for values only
 # knowable at fire time. Substituting them at reconcile time would freeze a
 # timestamp that goes stale between ticks, so the scheduler resolves them
@@ -1003,6 +1018,7 @@ class TaskScheduler:
             # created_at vs started_at if we ever surface that.
             run = db.query(TaskRun).filter(TaskRun.id == run_id).first()
             if run:
+                logger.info("TaskRun %s -> running (was %r)", run_id, run.status)
                 run.status = "running"
                 run.started_at = _utcnow()
                 run.result = "Starting…"
@@ -1156,6 +1172,7 @@ class TaskScheduler:
 
             db.commit()
             logger.info(f"Task '{task.name}' completed (run {run_id})")
+            logger.info("TaskRun %s persisted status=%s result_len=%s", run_id, run.status, len(run.result or ""))
             output = task.output_target or "session"
             # Per-task notification gate. Default True (notifications_enabled
             # defaults to True at column level), but skip when the user has
@@ -2178,8 +2195,10 @@ class TaskScheduler:
                         elif data.get("type") == "final_response":
                             # The completion gate may present its sanitized
                             # answer as one replacement instead of deltas.
-                            full_text = str(data.get("content") or "")
-                            final_text_replaced = True
+                            full_text, final_text_replaced = _merge_final_answer(
+                                full_text, final_text_replaced,
+                                data.get("content"),
+                            )
                         elif data.get("type") == "tool_output":
                             # Tool results — capture summary so we have SOMETHING even
                             # if the model never produces a final text response
@@ -2643,7 +2662,9 @@ class TaskScheduler:
             try:
                 live_ids = {row[0] for row in db.query(ScheduledTask.id).all()}
                 if live_ids:
-                    db.query(TaskRun).filter(~TaskRun.task_id.in_(list(live_ids))).delete(synchronize_session=False)
+                    _swept = db.query(TaskRun).filter(~TaskRun.task_id.in_(list(live_ids))).delete(synchronize_session=False)
+                    if _swept:
+                        logger.warning("ensure_defaults swept %s orphan TaskRun row(s)", _swept)
             except Exception:
                 pass
             existing_actions = {

@@ -243,7 +243,7 @@
     }
   },
   "file_hashes": {
-    "plugin.py": "sha256:93528edd9f59babba99edaa33738ea47c14762d69c217ba94353cb3b025b4906",
+    "plugin.py": "sha256:07738671d67badb9af9eec02be62a060a9bba2cf3aae2e6f961cf6b23fec7484",
     "ui/index.html": "sha256:1e7e72d980788c5b3fb1e953c95c0ee9fe1c20634578ba43d0b654f72f81d42a"
   }
 }

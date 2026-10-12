@@ -145,7 +145,16 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.execute("PRAGMA journal_mode=WAL")
+        # DELETE journal mode, deliberately NOT WAL. The database lives on
+        # the docker-compose bind mount, and WAL's shared-memory index is
+        # not coherent across the macOS Docker Desktop FUSE mount: any
+        # external sqlite process (seeding scripts, backups, probes) can
+        # checkpoint-and-truncate the WAL without seeing the frames the
+        # app just committed, silently destroying them. The rollback
+        # journal keeps every reader and writer on the file itself and
+        # stays correct over network filesystems ("WAL does not work over
+        # a network filesystem" — sqlite.org/wal.html).
+        cursor.execute("PRAGMA journal_mode=DELETE")
         cursor.close()
 
 
