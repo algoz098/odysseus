@@ -2049,10 +2049,11 @@ def compute_analysis_queue(messages, analyzed_rows, *, now,
     return new_intervals, list(analyzed_rows)
 
 
-_EFFECT_DISCLOSURE_RE = re.compile(
-    r"External operation .*? reported success; "
-    r"any external change it made was not independently verified\.",
-    re.S,
+# Extensions are AST-audited before enable and ``re.compile`` trips the
+# forbidden-call list (it exists to block ``compile`` as an exec vector).
+# Match the disclosure with plain string ops -- it is a fixed server string.
+_EFFECT_DISCLOSURE_TAIL = (
+    "reported success; any external change it made was not independently verified."
 )
 
 
@@ -2071,8 +2072,14 @@ def _run_produced_an_answer(run) -> bool:
     Release instead of seal so the interval is re-queued and retried.
     """
     result = str((run or {}).get("result") or "")
-    without_disclosure = _EFFECT_DISCLOSURE_RE.sub(" ", result).strip()
-    return bool(without_disclosure)
+    kept = []
+    for line in result.splitlines():
+        marker = line.find("External operation")
+        if marker >= 0 and _EFFECT_DISCLOSURE_TAIL in line[marker:]:
+            # Keep anything the model wrote before the disclosure on this line.
+            line = line[:marker]
+        kept.append(line)
+    return bool("".join(kept).strip())
 
 
 def seal_claims(claim_rows, runs, *, now,
