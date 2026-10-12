@@ -41,6 +41,7 @@ Lifecycle:
 
 import asyncio
 import hashlib
+import threading
 import json
 import logging
 import os
@@ -872,8 +873,20 @@ def _pin_webhook_token(host) -> str | None:
         from core.extensions import webhooks as _oxs_wh
     except Exception:
         return None
+    # The framework installs the record on the same call stack right after
+    # ``on_enable`` returns. Poll briefly so every enable path — async
+    # request, startup thread, tests — lands after the install instead of
+    # failing silently and leaving a freshly-rotated token in place.
     recs = _oxs_wh.list_for_extension(EXTENSION_ID)
+    waited = 0.0
+    while not recs and waited < 2.0:
+        time.sleep(0.05)
+        waited += 0.05
+        recs = _oxs_wh.list_for_extension(EXTENSION_ID)
     if not recs:
+        logger.warning(
+            "whats2api_bridge: webhook record never appeared; token NOT pinned"
+        )
         return None
     rec = recs[-1]  # the one we just installed
     saved = _read_inbound_token(host)
@@ -2638,6 +2651,12 @@ def _analyzer_reconcile(host, db, owner: str | None = None) -> dict:
     ).replace(
         "{interval_minutes}", str(s["interval_minutes"])
     )
+    # Stamp the live {since_ts} token with the configured window so the
+    # scheduler's fire-time expansion honors lookback_hours instead of
+    # assuming 24h. The token stays live (unexpanded) on purpose.
+    prompt = re.sub(
+        r"\{since_ts\}", "{since_ts:%d}" % s["lookback_hours"], prompt
+    )
     crew_id = _analyzer_ensure_crew(db, owner)
 
     if task is None:
@@ -3193,17 +3212,26 @@ def register(host):
         # token) runs AFTER ``on_enable`` returns, on the same call
         # stack. Schedule the pinner for the next event-loop tick so it
         # sees the installed record.
+        def _pin_now() -> None:
+            try:
+                pinned = _pin_webhook_token(host)
+                if pinned:
+                    logger.info(
+                        "whats2api_bridge inbound webhook token pinned to disk"
+                    )
+            except Exception:
+                logger.exception("whats2api_bridge: webhook token pin failed")
+
+        # ``_wire`` installs the webhook record on the same call stack
+        # AFTER ``on_enable`` returns, so the pin must run a tick later —
+        # never inline here (the previous inline fallback raced the
+        # install and silently left a freshly-rotated token in place,
+        # breaking the operator's whats2api.com URL on every restart).
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(_async_pin_webhook_token(host))
-            else:
-                _pin_webhook_token(host)
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, _pin_now)
         except RuntimeError:
-            # No running loop (tests) — call synchronously; the test
-            # framework installs the record before our test calls the
-            # pinner itself.
-            _pin_webhook_token(host)
+            threading.Thread(target=_pin_now, daemon=True).start()
 
         # ── Public status route (no session auth) ────────────────────
         host.add_route(

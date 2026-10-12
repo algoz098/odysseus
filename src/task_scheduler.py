@@ -84,7 +84,8 @@ def _merge_final_answer(full_text: str, final_text_replaced: bool, content) -> t
 # knowable at fire time. Substituting them at reconcile time would freeze a
 # timestamp that goes stale between ticks, so the scheduler resolves them
 # on every execution instead.
-_LIVE_PROMPT_PLACEHOLDERS = ("{since_ts}",)
+_LIVE_PROMPT_PLACEHOLDERS = ("{since_ts",)
+_SINCE_TS_RE = re.compile(r"\{since_ts(?::(\d{1,3}))?\}")
 
 
 def _expand_live_prompt_placeholders(prompt: str) -> str:
@@ -93,19 +94,22 @@ def _expand_live_prompt_placeholders(prompt: str) -> str:
     ``{since_ts}`` is the only one today: the whats2api analyzer needs the
     epoch cutoff of its own lookback window on every run, and a value baked
     at reconcile time would shrink the window a little more on every tick
-    until the task stopped seeing any messages at all. Unknown placeholders
-    are left untouched so a prompt that legitimately contains literal braces
-    is never corrupted.
+    until the task stopped seeing any messages at all. The token may carry
+    its own window in hours — ``{since_ts:48}`` — written by the extension
+    from its lookback setting at reconcile time; the bare form defaults to
+    24h. Unknown placeholders are left untouched so a prompt that
+    legitimately contains literal braces is never corrupted.
     """
     if not prompt or not any(tok in prompt for tok in _LIVE_PROMPT_PLACEHOLDERS):
         return prompt
-    import time as _time
-    resolved = {
-        "{since_ts}": str(int(_time.time()) - 24 * 3600),
-    }
-    for token, value in resolved.items():
-        prompt = prompt.replace(token, value)
-    return prompt
+    import time as _time  # noqa: F401 — used by _resolve below
+
+    def _resolve(m: "re.Match[str]") -> str:
+        hours = int(m.group(1) or 24)
+        hours = max(1, min(hours, 168))
+        return str(int(_time.time()) - hours * 3600)
+
+    return _SINCE_TS_RE.sub(_resolve, prompt)
 
 
 # ── Shared TTL cache (singleflight) ────────────────────────────────────────
