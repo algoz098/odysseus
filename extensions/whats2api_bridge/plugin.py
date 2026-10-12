@@ -558,31 +558,7 @@ def _read_tools(host, storage: PluginStorage):
         except Exception:
             logger.exception("whats2api_bridge: analysis_queue run lookup failed")
 
-        try:
-            if _adopt_is_enabled(host):
-                _raw_tracking = _s(host, "analyzer_tracking_since", None)
-                _tracking_since = (
-                    _coerce_setting_int(_raw_tracking, 0, 1, 2 ** 40)
-                    if _raw_tracking else None
-                )
-                adopted = _adopt_existing_intervals(
-                    storage, now=now, gap_seconds=gap,
-                    tracking_since=_tracking_since,
-                )
-                # One-shot: disarm so a later wipe of the table can never
-                # re-arm the migration behind the operator's back.
-                try:
-                    host.get_settings().set("analyzer_adopt_existing", False)
-                except Exception:
-                    logger.debug("could not clear adopt_existing flag",
-                                 exc_info=True)
-                if adopted:
-                    logger.info(
-                        "whats2api_bridge: adopted %d pre-tracking interval(s)",
-                        adopted,
-                    )
-        except Exception:
-            logger.exception("whats2api_bridge: interval adoption failed")
+        _maybe_adopt_intervals(storage, host, now=now, gap_seconds=gap)
 
         claimed_rows = [
             r for r in _load_interval_rows(storage)
@@ -760,14 +736,6 @@ def _read_tools(host, storage: PluginStorage):
 # allowlist at all — see ``_refuse_if_analyzer`` below, which is the only
 # thing standing between the periodic analyzer and ``send_message``.
 
-# Cached analyzer session ids, refreshed by ``_analyzer_reconcile``. Write
-# tools consult this on every call; the lookup is a single indexed read and
-# the result is memoised for ``_ANALYZER_GUARD_TTL`` seconds so a burst of
-# tool calls in one turn does not re-query the DB each time.
-_ANALYZER_SESSION_IDS: set = set()
-_ANALYZER_GUARD_TTL = 30.0
-_ANALYZER_GUARD_STAMP = 0.0
-
 
 def _adopt_is_enabled(host) -> bool:
     """Whether the pre-intervalization migration is armed.
@@ -782,20 +750,65 @@ def _adopt_is_enabled(host) -> bool:
     return bool(_s(host, "analyzer_adopt_existing", False))
 
 
-def _analyzer_session_ids() -> set:
-    """Session ids belonging to the analyzer's scheduled task.
+def _maybe_adopt_intervals(storage, host, *, now=None, gap_seconds=None) -> int:
+    """Run the pre-intervalization migration if — and only if — armed.
 
-    The crew ``enabled_tools`` allowlist only inverts over
-    ``BUILTIN_TOOL_DESCRIPTIONS``, so it never disables an ``mcp__*`` tool —
-    the scheduler force-*includes* allowlisted MCP names but has no deny
-    side for the rest. A prompt-level "NEVER call send_message" is not an
-    enforcement mechanism, so the guard is enforced here instead.
+    Single entry point on purpose. There were two callsites (enable and
+    queue) and the enable one bypassed both the opt-in flag and the
+    tracking boundary, so adoption ran on *every* enable and sealed
+    whatever was in the window. Two gates in one place is the only way
+    they stay in place.
     """
-    global _ANALYZER_SESSION_IDS, _ANALYZER_GUARD_STAMP
-    now = time.time()
-    if _ANALYZER_SESSION_IDS and (now - _ANALYZER_GUARD_STAMP) < _ANALYZER_GUARD_TTL:
-        return _ANALYZER_SESSION_IDS
-    ids: set = set()
+    if not _adopt_is_enabled(host):
+        return 0
+    try:
+        # Resolved here, not as a default: this helper sits above the
+        # interval-queue constants, and a default argument is evaluated at
+        # def time.
+        if gap_seconds is None:
+            gap_seconds = ANALYZER_INTERVAL_GAP_SECONDS
+        raw = _s(host, "analyzer_tracking_since", None)
+        tracking_since = (
+            _coerce_setting_int(raw, 0, 1, 2 ** 40) if raw else None
+        )
+        adopted = _adopt_existing_intervals(
+            storage,
+            now=int(now if now is not None else time.time()),
+            gap_seconds=gap_seconds,
+            tracking_since=tracking_since,
+        )
+        # One-shot: disarm, so a later wipe of the table can never re-arm
+        # the migration behind the operator's back.
+        host.get_settings().set("analyzer_adopt_existing", False)
+        if adopted:
+            logger.info(
+                "whats2api_bridge: adopted %d pre-tracking interval(s)", adopted,
+            )
+        return adopted
+    except Exception:
+        logger.exception("whats2api_bridge: interval adoption failed")
+        return 0
+
+
+def _analyzer_session_ids():
+    """Session ids belonging to the analyzer's scheduled task, or ``None``.
+
+    Deliberately uncached. The first version memoised this for 30 s, which
+    meant a freshly created or recreated analyzer task could answer calls
+    for half a minute with an empty set — and an empty set is "nobody is
+    the analyzer", i.e. the guard failing open on exactly the window where
+    it matters. It is one indexed read against a table with one row; there
+    is no micro-optimisation worth a fail-open path here.
+
+    ``None`` means "could not find out", which the caller must treat as
+    refuse. An empty set means "nobody" and means allow.
+
+    Belt and braces: since C-8 landed, a crew whose allowlist names any
+    ``mcp__*`` tool also has the rest of them denied by the scheduler. This
+    still matters because it holds for crews that never mention MCP, and for
+    any call path where no ``RequestAuthority`` is bound for the scheduler
+    to filter.
+    """
     try:
         from core.database import SessionLocal as _SL
         from core.database import ScheduledTask as _ST
@@ -806,15 +819,15 @@ def _analyzer_session_ids() -> set:
                 .filter(_ST.name == ANALYZER_TASK_NAME)
                 .all()
             )
-            ids = {r[0] for r in rows if r and r[0]}
+            return {r[0] for r in rows if r and r[0]}
         finally:
             db.close()
     except Exception:
-        logger.debug("analyzer session lookup failed", exc_info=True)
-        return _ANALYZER_SESSION_IDS
-    _ANALYZER_SESSION_IDS = ids
-    _ANALYZER_GUARD_STAMP = now
-    return ids
+        logger.warning(
+            "whats2api_bridge: analyzer session lookup failed; refusing "
+            "WhatsApp writes until it recovers", exc_info=True,
+        )
+        return None
 
 
 def _refuse_if_analyzer(tool_name: str):
@@ -822,20 +835,37 @@ def _refuse_if_analyzer(tool_name: str):
 
     The analyzer is read-only over WhatsApp by construction (§1 of the
     handoff): it persists findings to native Odysseus artifacts and never
-    writes back to the chat. That rule cannot be expressed as a crew
-    allowlist today, so every transport tool checks it here.
+    writes back to the chat.
+
+    Two ways to refuse. The obvious one is "this session is the analyzer".
+    The one that matters more in practice is "we could not find out": a
+    failed lookup returns ``None`` rather than an empty set, because empty
+    means "nobody" and would allow the write. Failing closed here costs at
+    most a manual retry, since the analyzer never calls these tools anyway.
     """
     try:
         from src.agent_runtime.authority import active_request_authority
         auth = active_request_authority()
     except Exception:
-        return None
+        return _err(
+            f"{tool_name} refused: could not verify the caller is not the "
+            f"Conversation Analyzer.",
+            blocked_by="analyzer_lookup_unavailable",
+        )
     if auth is None:
         return None
     session_id = str(getattr(auth, "session_id", "") or "")
     if not session_id:
         return None
-    if session_id not in _analyzer_session_ids():
+    ids = _analyzer_session_ids()
+    if ids is None:
+        return _err(
+            f"{tool_name} refused: could not verify the caller is not the "
+            f"Conversation Analyzer (analyzer session lookup failed). This "
+            f"fails closed on purpose — retry once the database responds.",
+            blocked_by="analyzer_lookup_unavailable",
+        )
+    if session_id not in ids:
         return None
     return _err(
         f"{tool_name} is not available to the Conversation Analyzer. The "
