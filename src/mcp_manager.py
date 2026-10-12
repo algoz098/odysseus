@@ -696,7 +696,17 @@ class McpManager:
             if "exit_code" in result:
                 return result
             if "error" in result:
-                return {"error": result["error"], "exit_code": 1}
+                # SPEC §4.3 envelopes carry more than the message:
+                # ``status_code``/``body`` tell the model whether the
+                # upstream rejected us or we failed, and extensions attach
+                # their own machine-readable markers (``blocked_by``). All
+                # of it used to be dropped here, so a handler that worked
+                # correctly still surfaced a bare string. ``ok`` stays out
+                # — it is the envelope's own marker and the MCP result
+                # already carries ``exit_code`` for the same decision.
+                return {
+                    k: v for k, v in result.items() if k != "ok"
+                } | {"exit_code": 1}
             return {"output": result, "exit_code": 0}
         if result is None:
             return {"output": "", "exit_code": 0}
@@ -805,6 +815,20 @@ class McpManager:
         session = self._sessions.get(server_id)
         if not session:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
+        # The in-process sentinel is truthy, so a tool name that is NOT in
+        # ``_in_process_tools`` used to fall through to ``_do_call`` and die
+        # with ``'object' object has no attribute 'call_tool'``. That hides
+        # the real cause (the plugin never registered that tool) behind an
+        # AttributeError from inside the manager. Say so instead.
+        if session is _INPROC_SESSION:
+            return {
+                "error": (
+                    f"Tool not found on in-process MCP server {server_id}: "
+                    f"{tool_name}. The extension did not register it — check "
+                    f"the tool's registration loop and the extension's enable log."
+                ),
+                "exit_code": 1,
+            }
 
         from src.agent_runtime.remote_resources import active_backend_operation
         bound_backend = active_backend_operation()

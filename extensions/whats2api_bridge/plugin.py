@@ -303,6 +303,15 @@ def _ensure_settings(host) -> None:
     _set_if_empty("analyzer_interval_minutes", 30)
     _set_if_empty("analyzer_lookback_hours", 24)
     _set_if_empty("analyzer_min_messages", 3)
+    # The boundary for interval adoption (see ``_adopt_existing_intervals``).
+    # Armed once, at first enable, and never moved: everything older is
+    # pre-tracking content that earlier runs already handled; everything
+    # newer is live work that must never be sealed without being analyzed.
+    _set_if_empty("analyzer_tracking_since", int(time.time()))
+    # The pre-intervalization migration is opt-in (see ``_adopt_is_enabled``).
+    # Seeding it False is deliberate: enabling it would let a wiped state
+    # table silently seal everything in the window.
+    _set_if_empty("analyzer_adopt_existing", False)
     # analyzer_prompt is deliberately NOT seeded: an empty value means
     # "use the live DEFAULT_ANALYZER_PROMPT" (see _analyzer_settings), so
     # prompt improvements ship with upgrades instead of being frozen by a
@@ -550,7 +559,28 @@ def _read_tools(host, storage: PluginStorage):
             logger.exception("whats2api_bridge: analysis_queue run lookup failed")
 
         try:
-            _adopt_existing_intervals(storage, now=now, gap_seconds=gap)
+            if _adopt_is_enabled(host):
+                _raw_tracking = _s(host, "analyzer_tracking_since", None)
+                _tracking_since = (
+                    _coerce_setting_int(_raw_tracking, 0, 1, 2 ** 40)
+                    if _raw_tracking else None
+                )
+                adopted = _adopt_existing_intervals(
+                    storage, now=now, gap_seconds=gap,
+                    tracking_since=_tracking_since,
+                )
+                # One-shot: disarm so a later wipe of the table can never
+                # re-arm the migration behind the operator's back.
+                try:
+                    host.get_settings().set("analyzer_adopt_existing", False)
+                except Exception:
+                    logger.debug("could not clear adopt_existing flag",
+                                 exc_info=True)
+                if adopted:
+                    logger.info(
+                        "whats2api_bridge: adopted %d pre-tracking interval(s)",
+                        adopted,
+                    )
         except Exception:
             logger.exception("whats2api_bridge: interval adoption failed")
 
@@ -722,6 +752,442 @@ def _read_tools(host, storage: PluginStorage):
         ),
     ]
 
+
+# ── Transport tools (outbound WhatsApp) ─────────────────────────────────────
+# The other half of the bridge. ``_read_tools`` above only reads what the
+# webhook already ingested; these talk to whats2api and change WhatsApp
+# state. They are the reason the extension has an ``ANALYZER_ALLOWED_TOOLS``
+# allowlist at all — see ``_refuse_if_analyzer`` below, which is the only
+# thing standing between the periodic analyzer and ``send_message``.
+
+# Cached analyzer session ids, refreshed by ``_analyzer_reconcile``. Write
+# tools consult this on every call; the lookup is a single indexed read and
+# the result is memoised for ``_ANALYZER_GUARD_TTL`` seconds so a burst of
+# tool calls in one turn does not re-query the DB each time.
+_ANALYZER_SESSION_IDS: set = set()
+_ANALYZER_GUARD_TTL = 30.0
+_ANALYZER_GUARD_STAMP = 0.0
+
+
+def _adopt_is_enabled(host) -> bool:
+    """Whether the pre-intervalization migration is armed.
+
+    Off by default, and that is the safe direction. Adoption marks content
+    as already analyzed without anyone having analyzed it, so getting it
+    wrong loses conversations silently; not running it costs a one-off
+    re-offer of old content, which is visible and recoverable. An operator
+    upgrading from a pre-interval build opts in once
+    (``analyzer_adopt_existing``) and the flag clears itself.
+    """
+    return bool(_s(host, "analyzer_adopt_existing", False))
+
+
+def _analyzer_session_ids() -> set:
+    """Session ids belonging to the analyzer's scheduled task.
+
+    The crew ``enabled_tools`` allowlist only inverts over
+    ``BUILTIN_TOOL_DESCRIPTIONS``, so it never disables an ``mcp__*`` tool —
+    the scheduler force-*includes* allowlisted MCP names but has no deny
+    side for the rest. A prompt-level "NEVER call send_message" is not an
+    enforcement mechanism, so the guard is enforced here instead.
+    """
+    global _ANALYZER_SESSION_IDS, _ANALYZER_GUARD_STAMP
+    now = time.time()
+    if _ANALYZER_SESSION_IDS and (now - _ANALYZER_GUARD_STAMP) < _ANALYZER_GUARD_TTL:
+        return _ANALYZER_SESSION_IDS
+    ids: set = set()
+    try:
+        from core.database import SessionLocal as _SL
+        from core.database import ScheduledTask as _ST
+        db = _SL()
+        try:
+            rows = (
+                db.query(_ST.session_id)
+                .filter(_ST.name == ANALYZER_TASK_NAME)
+                .all()
+            )
+            ids = {r[0] for r in rows if r and r[0]}
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("analyzer session lookup failed", exc_info=True)
+        return _ANALYZER_SESSION_IDS
+    _ANALYZER_SESSION_IDS = ids
+    _ANALYZER_GUARD_STAMP = now
+    return ids
+
+
+def _refuse_if_analyzer(tool_name: str):
+    """Return an error dict when the caller is the analyzer, else ``None``.
+
+    The analyzer is read-only over WhatsApp by construction (§1 of the
+    handoff): it persists findings to native Odysseus artifacts and never
+    writes back to the chat. That rule cannot be expressed as a crew
+    allowlist today, so every transport tool checks it here.
+    """
+    try:
+        from src.agent_runtime.authority import active_request_authority
+        auth = active_request_authority()
+    except Exception:
+        return None
+    if auth is None:
+        return None
+    session_id = str(getattr(auth, "session_id", "") or "")
+    if not session_id:
+        return None
+    if session_id not in _analyzer_session_ids():
+        return None
+    return _err(
+        f"{tool_name} is not available to the Conversation Analyzer. The "
+        f"analyzer is read-only over WhatsApp: it reads intervals and "
+        f"persists findings to Odysseus artifacts, and never writes to a "
+        f"chat. Use the bridge tools from an interactive session instead.",
+        blocked_by="analyzer_read_only_policy",
+    )
+
+
+def _transport_tools(host, storage: PluginStorage):
+    """Outbound tools: connection lifecycle + WhatsApp writes.
+
+    Same 4-tuple shape as :func:`_read_tools` (plus a 5th element,
+    ``needs_guard``, so the registration loop can wrap them with
+    ``_refuse_if_analyzer``). Every tool returns the SPEC §4.3 envelope.
+    """
+
+    async def _request(client, cid: str, method: str, params: dict):
+        """POST /connections/request — the one endpoint every call funnels
+        through, matching whats2api's Baileys/whatsmeow RPC surface."""
+        r = await client.post(
+            "/connections/request",
+            json={"connectionId": cid, "method": method, "params": params},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # ── Connection lifecycle ────────────────────────────────────────────
+
+    async def _list_connections(client, args, host):
+        r = await client.get("/connections")
+        r.raise_for_status()
+        data = r.json()
+        return _ok(data if isinstance(data, list) else {"connections": data})
+
+    async def _get_connection(client, cid, args, host):
+        r = await client.get(f"/connections/{cid}")
+        r.raise_for_status()
+        return _ok(r.json())
+
+    async def _create_connection(client, args, host):
+        body = {"name": args.get("name")}
+        if args.get("engine"):
+            body["engine"] = args["engine"]
+        if args.get("webhook_url"):
+            body["webhook_url"] = args["webhook_url"]
+        r = await client.post("/connections", json=body)
+        r.raise_for_status()
+        return _ok(r.json())
+
+    async def _patch_connection(client, cid, args, host):
+        body = {k: args[k] for k in ("name", "webhook_url") if args.get(k)}
+        if not body:
+            return _err("patch_connection needs at least one of name, webhook_url")
+        r = await client.patch(f"/connections/{cid}", json=body)
+        r.raise_for_status()
+        return _ok(r.json())
+
+    async def _remove_connection(client, cid, args, host):
+        r = await client.delete(f"/connections/{cid}")
+        if r.status_code >= 400:
+            r.raise_for_status()
+        return _ok({"removed": cid})
+
+    async def _start_connection(client, cid, args, host):
+        r = await client.post(f"/connections/{cid}/start")
+        r.raise_for_status()
+        return _ok(r.json())
+
+    async def _stop_connection(client, cid, args, host):
+        r = await client.post(f"/connections/{cid}/stop")
+        r.raise_for_status()
+        return _ok(r.json())
+
+    async def _health(client, args, host):
+        """Reachability probe. Never raises — a failure IS the answer."""
+        try:
+            r = await client.get("/connections")
+        except httpx.HTTPStatusError as e:
+            return _ok({
+                "healthy": False,
+                "status_code": e.response.status_code,
+                "connection_count": 0,
+            })
+        except httpx.HTTPError as e:
+            return _ok({
+                "healthy": False,
+                "error": f"{type(e).__name__}: {e}",
+                "connection_count": 0,
+            })
+        try:
+            data = r.json()
+        except Exception:
+            return _ok({
+                "healthy": False,
+                "status_code": r.status_code,
+                "connection_count": 0,
+            })
+        connections = data if isinstance(data, list) else []
+        return _ok({
+            "healthy": r.status_code < 400,
+            "status_code": r.status_code,
+            "connection_count": len(connections),
+        })
+
+    # ── Messaging ───────────────────────────────────────────────────────
+
+    async def _send_message(client, cid, args, host):
+        to = args.get("to")
+        text = args.get("text")
+        if not to:
+            return _err("send_message requires 'to' (the recipient remote_jid)")
+        if text is None:
+            return _err("send_message requires 'text'")
+        params = {"to": to, "text": text}
+        if args.get("quoted"):
+            params["quoted"] = args["quoted"]
+        if args.get("mentions"):
+            params["mentions"] = args["mentions"]
+        data = await _request(client, cid, "sendMessage", params)
+        try:
+            dispatch_via_event_bus(
+                "whats2api.message.sent",
+                owner=None,
+                payload={
+                    "connection_id": cid,
+                    "to": to,
+                    "text": text,
+                    "result": data,
+                },
+            )
+        except Exception:
+            logger.exception("whats2api.message.sent dispatch failed")
+        return _ok(data)
+
+    async def _send_reaction(client, cid, args, host):
+        key = args.get("key")
+        if not key:
+            return _err("send_reaction requires 'key' (the message key to react to)")
+        params = {"key": key, "text": args.get("text") or ""}
+        return _ok(await _request(client, cid, "sendReaction", params))
+
+    async def _mark_read(client, cid, args, host):
+        chat = args.get("chat")
+        ids = args.get("ids")
+        if not chat:
+            return _err("mark_read requires 'chat' (the remote_jid)")
+        if not ids:
+            return _err("mark_read requires 'ids' (a non-empty list of message ids)")
+        if isinstance(ids, str):
+            ids = [ids]
+        return _ok(await _request(client, cid, "readMessages", {
+            "chat": chat, "ids": list(ids),
+        }))
+
+    async def _send_media(client, cid, args, host):
+        to = args.get("to")
+        kind = args.get("kind")
+        url = args.get("url")
+        mimetype = args.get("mimetype")
+        missing = [
+            n for n, v in (
+                ("to", to), ("kind", kind), ("url", url), ("mimetype", mimetype)
+            ) if not v
+        ]
+        if missing:
+            return _err("send_media requires " + ", ".join(missing))
+        params = {
+            "to": to, "kind": kind, "url": url, "mimetype": mimetype,
+        }
+        if args.get("caption"):
+            params["caption"] = args["caption"]
+        if args.get("file_name"):
+            params["fileName"] = args["file_name"]
+        return _ok(await _request(client, cid, "sendMediaMessage", params))
+
+    async def _send_presence(client, cid, args, host):
+        presence = args.get("presence") or "available"
+        params = {"presence": presence}
+        if args.get("to"):
+            params["to"] = args["to"]
+        return _ok(await _request(client, cid, "sendPresenceUpdate", params))
+
+    async def _is_on_whatsapp(client, cid, args, host):
+        phones = args.get("phones")
+        if not phones:
+            return _err("is_on_whatsapp requires 'phones' (a non-empty list)")
+        if isinstance(phones, str):
+            phones = [phones]
+        return _ok(await _request(
+            client, cid, "isOnWhatsApp", {"phones": list(phones)},
+        ))
+
+    async def _call_method(client, cid, args, host):
+        """Generic RPC escape hatch — the method string goes upstream verbatim."""
+        method = args.get("method")
+        if not method:
+            return _err("call_method requires 'method'")
+        params = args.get("params")
+        if params is None:
+            params = []
+        elif isinstance(params, dict):
+            # whats2api accepts either a positional list or a named object;
+            # pass through whatever the caller wrote.
+            pass
+        elif not isinstance(params, list):
+            params = [params]
+        return _ok(await _request(client, cid, str(method), params))
+
+    def _spec(name, props, required=(), needs_cid=False):
+        schema = {
+            "type": "object",
+            "properties": props,
+            "additionalProperties": False,
+        }
+        if required:
+            schema["required"] = list(required)
+        return name, schema, needs_cid
+
+    cid_prop = {
+        "connection_id": {
+            "type": "string",
+            "description": "connection id; falls back to the default_connection_id setting",
+        }
+    }
+
+    def _with(cid_props, extra=None):
+        out = dict(cid_props)
+        out.update(extra or {})
+        return out
+
+    specs = [
+        _spec("list_connections", {}, needs_cid=False),
+        _spec("get_connection", _with(cid_prop), ("connection_id",), needs_cid=True),
+        _spec("create_connection", {
+            "name": {"type": "string", "description": "display name (required)"},
+            "engine": {"type": "string", "description": "baileys or whatsmeow"},
+            "webhook_url": {"type": "string", "description": "where whats2api posts events"},
+        }, ("name",), needs_cid=False),
+        _spec("patch_connection", _with(cid_prop, {
+            "name": {"type": "string"},
+            "webhook_url": {"type": "string"},
+        }), ("connection_id",), needs_cid=True),
+        _spec("remove_connection", _with(cid_prop), ("connection_id",), needs_cid=True),
+        _spec("start_connection", _with(cid_prop), ("connection_id",), needs_cid=True),
+        _spec("stop_connection", _with(cid_prop), ("connection_id",), needs_cid=True),
+        _spec("refresh_connections", {}, needs_cid=False),
+        _spec("health", {}, needs_cid=False),
+        _spec("send_message", _with(cid_prop, {
+            "to": {"type": "string", "description": "recipient remote_jid"},
+            "text": {"type": "string", "description": "message body"},
+            "quoted": {"type": "object", "description": "message key being quoted"},
+            "mentions": {"type": "array", "items": {"type": "string"},
+                         "description": "remote_jids to @-mention"},
+        }), ("to", "text"), needs_cid=True),
+        _spec("send_reaction", _with(cid_prop, {
+            "key": {"type": "object", "description": "message key from a prior event"},
+            "text": {"type": "string", "description": "the emoji; empty removes the reaction"},
+        }), ("key",), needs_cid=True),
+        _spec("mark_read", _with(cid_prop, {
+            "chat": {"type": "string", "description": "remote_jid to mark read"},
+            "ids": {"type": "array", "items": {"type": "string"},
+                    "description": "message ids to mark as read"},
+        }), ("chat", "ids"), needs_cid=True),
+        _spec("send_media", _with(cid_prop, {
+            "to": {"type": "string"},
+            "kind": {"type": "string",
+                     "enum": ["image", "video", "audio", "document", "ptt"]},
+            "url": {"type": "string", "description": "public or signed media URL"},
+            "mimetype": {"type": "string"},
+            "caption": {"type": "string"},
+            "file_name": {"type": "string"},
+        }), ("to", "kind", "url", "mimetype"), needs_cid=True),
+        _spec("send_presence", _with(cid_prop, {
+            "presence": {"type": "string",
+                         "description": "available / unavailable / typing / recording"},
+            "to": {"type": "string", "description": "optional single-jid presence"},
+        }), (), needs_cid=True),
+        _spec("is_on_whatsapp", _with(cid_prop, {
+            "phones": {"type": "array", "items": {"type": "string"},
+                       "description": "E.164 numbers to probe"},
+        }), ("phones",), needs_cid=True),
+        _spec("call_method", _with(cid_prop, {
+            "method": {"type": "string",
+                       "description": "RPC method name, passed upstream verbatim"},
+            "params": {"description": "positional list or named object (default [])"},
+        }), ("method",), needs_cid=True),
+    ]
+
+    fns = {
+        "list_connections": (_list_connections, False),
+        "get_connection": (_get_connection, True),
+        "create_connection": (_create_connection, False),
+        "patch_connection": (_patch_connection, True),
+        "remove_connection": (_remove_connection, True),
+        "start_connection": (_start_connection, True),
+        "stop_connection": (_stop_connection, True),
+        "refresh_connections": (_list_connections, False),
+        "health": (_health, False),
+        "send_message": (_send_message, True),
+        "send_reaction": (_send_reaction, True),
+        "mark_read": (_mark_read, True),
+        "send_media": (_send_media, True),
+        "send_presence": (_send_presence, True),
+        "is_on_whatsapp": (_is_on_whatsapp, True),
+        "call_method": (_call_method, True),
+    }
+
+    rich = {
+        "list_connections": "List the WhatsApp connections registered on the "
+                            "whats2api account, with their engine, phone and live status.",
+        "get_connection": "Fetch one WhatsApp connection by id from whats2api.",
+        "create_connection": "Register a new WhatsApp connection (a linked device) on "
+                             "the whats2api account. Returns the connection id and the "
+                             "QR/pairing payload whats2api issues.",
+        "patch_connection": "Rename a WhatsApp connection or change the webhook URL "
+                            "whats2api posts its events to.",
+        "remove_connection": "Delete a WhatsApp connection from the account and drop its "
+                             "linked device.",
+        "start_connection": "Bring a WhatsApp connection back online after it was "
+                            "stopped or dropped.",
+        "stop_connection": "Take a WhatsApp connection offline without deleting it.",
+        "refresh_connections": "Refresh and list the WhatsApp connections, picking up any "
+                               "connection whose status changed on the provider side.",
+        "health": "Check whether the whats2api API is reachable and how many WhatsApp "
+                  "connections it currently reports. Never raises — the result is the "
+                  "healthy flag plus the connection count.",
+        "send_message": "Send a WhatsApp text message to a contact. WRITES to the chat. "
+                        "Requires a connection_id (or the default_connection_id setting). "
+                        "Returns the upstream message key.",
+        "send_reaction": "React to a specific WhatsApp message with an emoji. WRITES to "
+                         "the chat. An empty text removes an existing reaction.",
+        "mark_read": "Mark one or more WhatsApp messages as read in a chat. WRITES read "
+                     "receipt state for the operator's own number.",
+        "send_media": "Send an image, video, audio, document or voice note to a contact "
+                      "from a URL. WRITES to the chat.",
+        "send_presence": "Publish the operator's WhatsApp presence (available, typing, "
+                         "recording) for one chat or globally. WRITES presence state.",
+        "is_on_whatsapp": "Check whether a list of phone numbers has a WhatsApp account. "
+                          "Read-only despite living in the messaging family.",
+        "call_method": "Call any whats2api/Baileys RPC method by name, passing params "
+                       "through verbatim. The escape hatch for shapes the typed tools "
+                       "above do not cover — and a WRITER, since it can reach any method.",
+    }
+
+    out = []
+    for name, schema, needs_cid in specs:
+        fn, cid_arg = fns[name]
+        handler = _make_async_handler(host, fn, needs_connection_id=cid_arg)
+        out.append((name, schema, handler, rich[name]))
+    return out
 
 
 # ── Inbound webhook handler ────────────────────────────────────────────────
@@ -2211,25 +2677,47 @@ def _claim_intervals(storage, intervals, *, now) -> None:
 
 
 def _adopt_existing_intervals(storage, *, now,
-                              gap_seconds=ANALYZER_INTERVAL_GAP_SECONDS) -> int:
-    """One-time migration: mark everything already sealed as analyzed.
+                              gap_seconds=ANALYZER_INTERVAL_GAP_SECONDS,
+                              tracking_since: int | None = None) -> int:
+    """One-time migration: mark pre-tracking content as already analyzed.
 
     Content that predates interval tracking was processed by earlier runs;
     re-offering it on the first upgraded run would recreate every old
-    finding. Runs only while the state table is empty. Groups that are
-    still unsealed (too recent to be final) stay unadopted — they are
-    genuinely new work.
+    finding. **Opt-in only** — see ``_adopt_is_enabled``.
+
+    ``tracking_since`` is the boundary, and it is the whole reason this is
+    safe. Without it, "the state table is empty" was read as "nothing has
+    ever been tracked", so *whatever happened to be in the window right
+    now* got sealed as analyzed — including messages that had just
+    arrived. That is silent loss, the same shape as A-1.
+
+    Note the queue only offers intervals that have been quiet for a full
+    ``gap_seconds`` (45 min), so test or replayed content is necessarily
+    backdated relative to any wall-clock boundary. That is why adoption
+    cannot be on by default: it would swallow exactly the material it is
+    supposed to leave alone.
     """
     if _load_interval_rows(storage):
         return 0
+    if tracking_since is None:
+        # No boundary known — refuse to adopt rather than guess. An
+        # unbounded adoption can only ever lose data; a skipped one is
+        # re-offered to the model, which is recoverable.
+        logger.warning(
+            "whats2api_bridge: interval adoption skipped — no tracking "
+            "boundary recorded; existing content stays available to the "
+            "analyzer instead of being sealed silently"
+        )
+        return 0
     msgs = _fetch_window_messages(storage, 0, limit=5000)
-    sealed, _ = compute_analysis_queue(msgs, [], now=now, gap_seconds=gap_seconds)
+    pre_tracking = [m for m in msgs if _msg_ts(m) < int(tracking_since)]
+    sealed, _ = compute_analysis_queue(pre_tracking, [], now=now, gap_seconds=gap_seconds)
     for iv in sealed:
         storage.execute_write(
             f"INSERT OR REPLACE INTO {_interval_table(storage)} "
-            f"(id, chat_jid, start_ts, end_ts, msg_count, status, analyzed_at, "
-            f"findings_summary) VALUES (:id, :chat_jid, :start_ts, :end_ts, "
-            f":msg_count, 'analyzed', :t, 'adopted: pre-intervalization content')",
+            "(id, chat_jid, start_ts, end_ts, msg_count, status, analyzed_at, "
+            "findings_summary) VALUES (:id, :chat_jid, :start_ts, :end_ts, "
+            ":msg_count, 'analyzed', :t, 'adopted: pre-intervalization content')",
             {
                 "id": iv["id"],
                 "chat_jid": iv["chat_jid"],
@@ -3226,6 +3714,33 @@ def register(host):
                 TOOL_NS, tool_name, schema, handler,
                 description_rich=description_rich,
                 read_only=True,
+            )
+
+        # Transport tools: the outbound half of the bridge. Registered
+        # ``read_only=False`` on purpose — they change WhatsApp state, so the
+        # capability/approval gate must treat them as unclassified rather
+        # than let a transcript full of untrusted inbound messages talk them
+        # through a post-external-context approval a scheduled run can't give.
+        #
+        # Each is wrapped in ``_refuse_if_analyzer`` because the crew
+        # allowlist cannot do it: the scheduler inverts ``enabled_tools``
+        # over ``BUILTIN_TOOL_DESCRIPTIONS`` only, which contains no
+        # ``mcp__*`` names, so an allowlisted-MCP force-include exists with
+        # no matching deny. The analyzer stays read-only over WhatsApp
+        # because the handler checks, not because the prompt asks nicely.
+        for tool_name, schema, handler, description_rich in _transport_tools(host, storage):
+            _base_handler = handler
+
+            async def _guarded(args, _h=_base_handler, _name=tool_name):
+                refusal = _refuse_if_analyzer(_name)
+                if refusal is not None:
+                    return refusal
+                return await _h(args)
+
+            host.register_mcp_tool(
+                TOOL_NS, tool_name, schema, _guarded,
+                description_rich=description_rich,
+                read_only=False,
             )
 
         # ── Inbound webhook for whats2api events ──────────────────────
