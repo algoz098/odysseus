@@ -148,3 +148,47 @@ class TestFirstEventWatchdog:
 
     def test_local_endpoints_keep_their_tighter_budget(self):
         assert _first_token_timeout("http://127.0.0.1:1234/v1/chat/completions", 300) == 60.0
+
+
+class TestManifestIsNotAContinuation:
+    """A manifest prompt carries its own contract; it continues nothing.
+
+    The analyzer prompt matched ``_ACTION_CONTINUATION_RE`` on its own rule
+    text — "Only read/write data belonging to **this** operator" parses as
+    ``read`` ... ``this`` — so the turn was classified as a follow-up and the
+    retrieval query was replaced by truncated recent context instead of the
+    prompt that actually describes the job.
+    """
+
+    @staticmethod
+    def _scheduler_messages(prompt: str) -> list[dict]:
+        # Shape task_scheduler builds: system, datetime context, task prompt.
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "The current date is Monday, October 12, 2026."},
+            {"role": "user", "content": prompt},
+        ]
+
+    def test_analyzer_prompt_is_not_a_continuation(self):
+        intent = al._classify_agent_request(self._scheduler_messages(ANALYZER_PROMPT), ANALYZER_PROMPT)
+        assert intent["continuation"] is False
+
+    def test_retrieval_query_is_the_whole_prompt(self):
+        intent = al._classify_agent_request(self._scheduler_messages(ANALYZER_PROMPT), ANALYZER_PROMPT)
+        assert intent["retrieval_query"] == ANALYZER_PROMPT.strip()
+
+    def test_real_followups_are_still_continuations(self):
+        history = [
+            {"role": "user", "content": "add a meeting"},
+            {"role": "assistant", "content": "Sure, add it for"},
+            {"role": "user", "content": "do it"},
+        ]
+        assert al._classify_agent_request(history, "do it")["continuation"] is True
+
+    def test_real_pronoun_followups_are_still_continuations(self):
+        history = [
+            {"role": "user", "content": "book the flight"},
+            {"role": "assistant", "content": "Booked. Want to move it?"},
+            {"role": "user", "content": "move it to friday"},
+        ]
+        assert al._classify_agent_request(history, "move it to friday")["continuation"] is True

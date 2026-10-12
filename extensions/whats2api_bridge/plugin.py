@@ -2049,6 +2049,32 @@ def compute_analysis_queue(messages, analyzed_rows, *, now,
     return new_intervals, list(analyzed_rows)
 
 
+_EFFECT_DISCLOSURE_RE = re.compile(
+    r"External operation .*? reported success; "
+    r"any external change it made was not independently verified\.",
+    re.S,
+)
+
+
+def _run_produced_an_answer(run) -> bool:
+    """Whether a successful run actually said something about its claims.
+
+    ``status == "success"`` only means the agent loop did not error. A model
+    that refuses ("I acknowledge the context, but I need to point out an
+    issue") or that answers from the prompt without ever reading the queue
+    still finishes success. Sealing on that alone drops the interval for good:
+    its promises never become findings, and no later run sees the content
+    again because the harness now reports it as done. Observed on the E2E --
+    one attempt sealed an interval with zero findings and the three runs after
+    it all saw an empty queue.
+
+    Release instead of seal so the interval is re-queued and retried.
+    """
+    result = str((run or {}).get("result") or "")
+    without_disclosure = _EFFECT_DISCLOSURE_RE.sub(" ", result).strip()
+    return bool(without_disclosure)
+
+
 def seal_claims(claim_rows, runs, *, now,
                 ttl_seconds=_ANALYZER_CLAIM_TTL_SECONDS):
     """Decide what happens to claimed intervals once runs have finished.
@@ -2056,8 +2082,10 @@ def seal_claims(claim_rows, runs, *, now,
     ``runs`` items are ``{id, started_at, finished_at, status, result}``
     with epoch seconds (``finished_at`` may be ``None`` while in flight):
 
-    - a claim made during a run that later finished ``success`` is sealed
-      (the interval is analyzed; the run's result becomes its summary);
+    - a claim made during a run that later finished ``success`` *and produced
+      an answer* is sealed (the interval is analyzed; the run's result becomes
+      its summary). A success that only emitted the effect disclosure sealed
+      nothing -- that run never looked at the interval;
     - a claim whose run finished without success is released so the
       interval re-enters the queue — no silent loss on failure;
     - a claim older than ``ttl_seconds`` is released the same way (crash
@@ -2087,6 +2115,7 @@ def seal_claims(claim_rows, runs, *, now,
             if (
                 (run.get("status") or "") == "success"
                 and start - _ANALYZER_RUN_SLACK_SECONDS <= claimed_at <= fin
+                and _run_produced_an_answer(run)
             ):
                 sealed_by = run
                 break

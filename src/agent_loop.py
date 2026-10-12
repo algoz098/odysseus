@@ -10942,7 +10942,14 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     retry_continuation = _is_contextual_retry_continuation(messages, text)
     link_continuation = _is_contextual_link_followup(messages, text)
     self_contained_workspace_sequence = _is_self_contained_workspace_sequence(text)
-    continuation = (
+    # A tool-manifest prompt (scheduled task, extension procedure) carries its
+    # own role, scope, tool table and output contract, so it is self-contained
+    # and continues nothing. It still has to be excluded explicitly: the
+    # analyzer prompt matched ``_ACTION_CONTINUATION_RE`` on its own rule text
+    # ("read/write data belonging to this operator" -> read ... this), which
+    # sent the turn down the continuation path and replaced the retrieval query
+    # with truncated recent context.
+    continuation = False if _is_tool_manifest_prompt(text) else (
         _is_explicit_continuation(text)
         or (
             len(messages or []) > 1
@@ -22798,6 +22805,13 @@ async def stream_agent_loop(
     # settings make web tools visible even when tool RAG misses them;
     # route-level disabled_tools decides what remains allowed.
     _exact_forced_native_chain = False
+    # Snapshot the RAG-selected set BEFORE forced tools are merged in.
+    # The MCP merge below unions it with _relevant_tools so that forcing
+    # web/native tools cannot drop MCP tools retrieval already found.
+    # It used to be assigned only inside the exact-native-chain branch, so
+    # every other path raised UnboundLocalError here (21 test_tool_policy
+    # failures). Same idiom as the re-derivation further below.
+    _base_relevant_tools = None if _relevant_tools is None else set(_relevant_tools)
     if not guide_only and forced_tools:
         forced_set = {t for t in forced_tools if t not in disabled_tools}
         _exact_forced_native_chain = bool(
