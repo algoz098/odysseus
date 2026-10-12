@@ -65,6 +65,68 @@ def compose_task_relevant_tools(rag_tools, assistant_always, disabled_tools):
     return tools
 
 
+def _live_mcp_tool_names() -> set:
+    """Every ``mcp__<server>__<tool>`` currently registered, in-process included.
+
+    Best-effort: returns an empty set if the manager is unavailable, which
+    makes the caller's inversion a no-op rather than a wrong answer.
+    """
+    try:
+        from src.mcp_manager import get_mcp_manager
+        mgr = get_mcp_manager()
+        if mgr is None:
+            return set()
+        return {
+            f"mcp__{row.get('server_id', '')}__{row.get('name')}"
+            for row in (mgr.get_all_tools() or [])
+            if row.get("name") and row.get("server_id")
+        }
+    except Exception:
+        logger.debug("live MCP tool inventory unavailable", exc_info=True)
+        return set()
+
+
+def crew_disabled_tools(crew) -> set:
+    """Invert a crew's ``enabled_tools`` allowlist into a deny set.
+
+    ``BUILTIN_TOOL_DESCRIPTIONS`` holds no ``mcp__*`` names, so inverting the
+    allowlist over it alone leaves every MCP tool reachable — including the
+    WhatsApp write tools the analyzer's crew exists to withhold. Confirmed on
+    a live run: the analyzer's schema carried ``send_message``, ``call_method``
+    and ten siblings, because the RAG lane had retrieved them semantically and
+    nothing took them back out. The scheduler already force-*includes*
+    allowlisted ``mcp__*`` names (``always_include``); this closes the missing
+    deny side.
+
+    Opt-in by intent: the MCP inversion runs only when the crew's allowlist
+    actually names an ``mcp__*`` tool. A crew that never mentioned MCP keeps
+    today's behaviour exactly, so existing crews do not silently lose tools
+    they were relying on.
+    """
+    disabled: set = set()
+    if not (crew and getattr(crew, "enabled_tools", None)):
+        return disabled
+    try:
+        enabled = json.loads(crew.enabled_tools)
+    except Exception:
+        return disabled
+    if not (isinstance(enabled, list) and enabled):
+        return disabled
+
+    try:
+        from src.tool_index import BUILTIN_TOOL_DESCRIPTIONS
+        disabled |= set(BUILTIN_TOOL_DESCRIPTIONS.keys()) - set(enabled)
+    except Exception:
+        logger.debug("builtin tool index unavailable", exc_info=True)
+
+    mcp_enabled = {t for t in enabled if isinstance(t, str) and t.startswith("mcp__")}
+    if mcp_enabled:
+        live = _live_mcp_tool_names()
+        if live:
+            disabled |= live - mcp_enabled
+    return disabled
+
+
 def _merge_final_answer(full_text: str, final_text_replaced: bool, content) -> tuple[str, bool]:
     """Fold a ``final_response`` payload into the collected answer text.
 
@@ -1766,16 +1828,10 @@ class TaskScheduler:
         # or AUTH_ENABLED=false scheduled task would still see and call shell/
         # file tools after the operator disabled them globally, because the
         # prompt/schema/execution gates only enforce what is passed in.
-        disabled_tools: set[str] = set()
-        if crew and crew.enabled_tools:
-            try:
-                enabled = json.loads(crew.enabled_tools)
-                if isinstance(enabled, list) and enabled:
-                    from src.tool_index import BUILTIN_TOOL_DESCRIPTIONS
-                    all_tools = set(BUILTIN_TOOL_DESCRIPTIONS.keys())
-                    disabled_tools |= all_tools - set(enabled)
-            except Exception:
-                pass
+        # The crew allowlist now covers ``mcp__*`` too, not just builtins —
+        # see crew_disabled_tools(). A WhatsApp-writing crew was previously
+        # offered the WhatsApp write tools anyway.
+        disabled_tools: set[str] = crew_disabled_tools(crew)
         try:
             from src.settings import get_setting
             _global_disabled = get_setting("disabled_tools", [])
