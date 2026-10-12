@@ -4566,13 +4566,43 @@ def _clean_notes_search_query(value: str) -> str:
     return query
 
 
-def _notes_general_definition_answer(text: str) -> Optional[str]:
-    """Answer note-like word questions that are not saved-note requests."""
+_NOTES_DEFINITION_MAX_CHARS = 300
 
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
-    lower = value.lower()
-    if not value:
+
+def _notes_general_definition_answer(text: str) -> Optional[str]:
+    """Answer note-like word questions that are not saved-note requests.
+
+    This exists for a person typing "what is a note?" into chat. It was
+    written without a shape check on the *input*, and that turns out to be
+    the whole problem: any long instruction prompt that happens to contain
+    "what", "explain" or "meaning" trips it, and the caller then throws away
+    the model's tool calls and substitutes a dictionary sentence.
+
+    The WhatsApp Conversation Analyzer hit exactly this. Its manifest says
+    "intervals already analyzed, with **what** was persisted", so every run
+    discarded the note the model had just written about a real message and
+    answered "A note can mean a short written record, a comment, or a
+    musical pitch" instead. Silent, and it looked like the analyzer was just
+    being unhelpful.
+
+    So: a definition question is short and is not a document. Reject
+    anything long, multi-line, bulleted, or carrying code/tool names before
+    looking for trigger words.
+    """
+    raw = str(text or "").strip()
+    if not raw:
         return None
+    if len(raw) > _NOTES_DEFINITION_MAX_CHARS:
+        return None
+    non_empty = [ln for ln in raw.splitlines() if ln.strip()]
+    if len(non_empty) > 2:
+        return None
+    if re.search(r"(?m)^\s*(?:[-*+]\s|#{1,6}\s|\d+[.)]\s)", raw):
+        return None
+    if re.search(r"`|\*\*", raw):
+        return None
+    value = re.sub(r"\s+", " ", raw).strip()
+    lower = value.lower()
     if re.search(r"\b(?:my|saved|open|show|list|search|find|create|add|delete|archive|pin|tag)\s+(?:notes?|checklists?)\b", lower):
         return None
     if not re.search(r"\b(?:what(?:'s| is)?|define|explain|meaning|mean|difference|synonym|sentence)\b", lower):
