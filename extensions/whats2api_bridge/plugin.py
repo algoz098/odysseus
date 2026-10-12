@@ -167,6 +167,19 @@ when an interval needs more context.
 | Future event with an unambiguous date/time     | `manage_calendar`  |
 | Decision / context / person fact worth keeping | `manage_notes` or `manage_memory` |
 | New contact / phone / handle                   | `manage_memory`    |
+| Plan or arrangement agreed in the chat, however casual | `manage_notes` (plus `manage_calendar` when it has a resolvable day) |
+
+**A casual plan is still content.** "Amanhã vamos tomar sorvete" is an
+arrangement someone made with the operator — it belongs in a note. Treating it
+as noise loses it forever, because the interval is sealed once judged.
+Bias toward `manage_notes` for anything that says the operator is going to
+do, meet, or forget something.
+
+**Relative dates are resolvable.** Today's date is in your context. "amanhã" is
+tomorrow, "sexta" is this Friday, "semana que vem" is within seven days.
+Compute them — do not skip an item merely because the chat used a relative
+word instead of a date. Only genuinely unresolvable ones ("em breve", "logo
+mais") are ambiguous.
 
 Read tools (always allowed):
 - `mcp__oxs_whats2api_bridge__list_messages`
@@ -181,7 +194,8 @@ Read tools (always allowed):
    `python`, `read_file`, `write_file`, `edit_file`, `apply_patch`. These tools
    are filtered out at the framework level, but respect the intent.
 2. **No fabrication.** If a deadline is vague ("em breve"), do not create a task.
-   If a date is ambiguous, skip the calendar entry.
+   If a date is genuinely unresolvable, skip the calendar entry — but compute
+   relative dates rather than treating them as ambiguous.
 3. **Be terse.** No preamble, no chain-of-thought, no "let me check the data".
 4. **Owner scope.** Only read/write data belonging to this operator.
 
@@ -2988,20 +3002,42 @@ _EFFECT_DISCLOSURE_TAIL = (
 
 
 def _run_produced_an_answer(run) -> bool:
-    """Whether a successful run actually said something about its claims.
+    """Whether a run demonstrably engaged with the analysis queue.
 
-    ``status == "success"`` only means the agent loop did not error. A model
-    that refuses ("I acknowledge the context, but I need to point out an
-    issue") or that answers from the prompt without ever reading the queue
-    still finishes success. Sealing on that alone drops the interval for good:
-    its promises never become findings, and no later run sees the content
-    again because the harness now reports it as done. Observed on the E2E --
-    one attempt sealed an interval with zero findings and the three runs after
-    it all saw an empty queue.
+    ``status == "success"`` only means the agent loop did not error. What it
+    does *not* mean is that the loop saw an interval, so it is not enough on
+    its own (A-1).
 
-    Release instead of seal so the interval is re-queued and retried.
+    The second signal is the effect disclosure the agent loop appends for
+    external calls. Its presence proves the model actually called
+    ``get_analysis_queue``; a run that answers straight from the prompt
+    leaves no disclosure at all, and that is exactly the A-1 case where
+    sealing would drop the interval forever.
+
+    Why prose is *not* the signal any more
+    --------------------------------------
+    Prose and work are independent. A live run analysed "Aman�� vamo tomar
+    sorvete" from a real WhatsApp message, wrote a note AND a calendar
+    event, then finished with six empty rounds -- result was the disclosure
+    and nothing else. Judged on prose that reads as "did nothing", so the
+    claim was released, and every subsequent run re-analysed the same
+    interval and wrote the note and the event again.
+
+    Both states are observationally identical from the run record: no prose,
+    disclosure present. There is no tool-execution table to break the tie.
+    So the tie is broken towards sealing, because the failure modes are not
+    symmetric -- duplicates are visible and deletable, a silently dropped
+    conversation is neither, and the retry loop makes duplication certain
+    rather than possible.
+
+    What this gives up: a run that reads the queue, decides nothing is worth
+    persisting, and then stays silent still seals. The prompt asks for an
+    explicit "no actionable items" line in that case, and prose is still
+    honoured as a signal when present -- only the silence is forgiven.
     """
     result = str((run or {}).get("result") or "")
+    if "get_analysis_queue" in result:
+        return True
     kept = []
     for line in result.splitlines():
         marker = line.find("External operation")
