@@ -1033,6 +1033,229 @@ def _refuse_if_analyzer(tool_name: str):
     )
 
 
+# ── Engine-aware RPC mapping ───────────────────────────────────────────────
+#
+# whats2api exposes the *same intent* under different method names and
+# different wire shapes depending on the connection's engine, and the engine
+# is fixed for the life of the connection. There is no single spelling that
+# works for both, and guessing wrong does not fail loudly -- it fails at the
+# WhatsApp server.
+#
+#   baileys  (JS, the classic Baileys client)
+#   hypermeow (Go, whatsmeow speaking waE2E protojson)
+#
+# Verified against the provider's method reference, and against a live
+# connection whose engine field reads "hypermeow". The names below are what
+# each engine actually dispatches; the payload builders next to them are the
+# shapes each engine's protobuf/JS object expects.
+
+_ENGINE_METHODS: dict = {
+    "baileys": {
+        "send_text": "sendMessage",
+        "send_reaction": "sendMessage",
+        "send_media": "sendMessage",
+        "mark_read": "readMessages",
+        "send_presence": "sendPresenceUpdate",
+        "is_on_whatsapp": "onWhatsApp",
+        "delete_message": "sendMessage",
+    },
+    "hypermeow": {
+        "send_text": "SendMessage",
+        "send_reaction": "SendMessage",
+        "send_media": "SendMessage",
+        "mark_read": "MarkRead",
+        "send_presence": "SendPresence",
+        "is_on_whatsapp": "IsOnWhatsApp",
+        "delete_message": "RevokeMessage",
+    },
+}
+
+# Hypermeow wraps each message kind in its own protojson field, and the
+# media fields require fileLength -- a number we cannot invent, since it is
+# the byte length of the media being served.
+_HYPERMEOW_MEDIA_FIELD = {
+    "image": "imageMessage",
+    "video": "videoMessage",
+    "audio": "audioMessage",
+    "document": "documentMessage",
+    "ptt": "audioMessage",
+}
+
+_ENGINE_CACHE: dict = {"at": 0.0}
+_ENGINE_TTL = 60.0
+
+
+def _normalise_engine(raw) -> str:
+    """``hypermeow``/``whatsmeow``/``baileys`` → the map key, default baileys."""
+    value = str(raw or "").strip().lower()
+    if value in ("hypermeow", "whatsmeow", "go", "whatsmeow (go)"):
+        return "hypermeow"
+    if value in ("baileys", "js", "baileys (js)"):
+        return "baileys"
+    return "baileys"
+
+
+def _unpack_connections(payload) -> list:
+    """Normalise ``GET /connections`` into a plain list.
+
+    whats2api (a Feathers app) returns a paginated envelope
+    ``{"total": n, "limit": …, "skip": …, "data": [...]}``, not a bare
+    array -- which is what the provider actually does, verified live.
+    Assuming a bare list silently produced ``connection_count: 0`` in
+    ``health`` and an unreadable envelope from ``list_connections``.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "connections", "results", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        # A single connection document (from GET /connections/:id).
+        if payload.get("_id") or payload.get("id"):
+            return [payload]
+    return []
+
+
+async def _engine_for(client, cid: str, *, force: bool = False) -> str:
+    """Which engine drives this connection.
+
+    Read from the connection document and memoised briefly: it is immutable
+    for the life of the connection, but a cache miss costs one GET and a
+    wrong answer costs a failed send.
+    """
+    now = time.time()
+    if (not force and _ENGINE_CACHE.get("cid") == cid
+            and now - (_ENGINE_CACHE.get("at") or 0.0) < _ENGINE_TTL):
+        return _ENGINE_CACHE.get("engine") or "baileys"
+    engine = "baileys"
+    try:
+        r = await client.get(f"/connections/{cid}")
+        if r.status_code < 400:
+            engine = _normalise_engine(_unpack_connections(r.json())[0]
+                                       .get("engine") if _unpack_connections(r.json())
+                                       else None)
+    except Exception:
+        logger.debug("engine lookup failed for %s; assuming baileys", cid,
+                     exc_info=True)
+    _ENGINE_CACHE.update({"cid": cid, "engine": engine, "at": now})
+    return engine
+
+
+def _method_for(engine: str, intent: str) -> str:
+    return (_ENGINE_METHODS.get(_normalise_engine(engine))
+            or _ENGINE_METHODS["baileys"]).get(intent, intent)
+
+
+def _jid_for_key(key: dict) -> str:
+    """The chat a reaction/revoke targets, taken from the message key."""
+    if not isinstance(key, dict):
+        return ""
+    return str(key.get("remoteJid") or key.get("remote_jid") or "")
+
+
+def _text_params(engine: str, to: str, text: str, *,
+                 quoted=None, mentions=None) -> list:
+    """Positional params for a text send, per engine.
+
+    ``params`` is an array the provider validates positionally -- sending an
+    object returns ``"/params" must be array`` -- and the layout differs:
+
+      hypermeow  ``[jid, message]``   (message is waE2E protojson)
+      baileys    ``[jid, {text}, {quoted}?, {mentions}?]``
+
+    Hypermeow nests a quote under ``contextInfo.quotedMessage`` and a
+    mention under ``contextInfo.mentionedJid``; Baileys takes them as
+    separate trailing objects. Learned from the provider, which rejects
+    every other arrangement with a description of what it wanted.
+    """
+    if _normalise_engine(engine) == "hypermeow":
+        # The `message` argument is a waE2E.Message protojson, so a bare
+        # {"text": ...} is rejected with `proto: unknown field "text"`. The
+        # text lives in the extendedTextMessage oneof member, which is also
+        # where contextInfo (quote / mentions) has to sit. {"conversation":
+        # ...} also validates and is the legacy simple form, but it cannot
+        # carry a quote.
+        extended: dict = {"text": text}
+        context: dict = {}
+        if quoted:
+            context["quotedMessage"] = quoted
+        if mentions:
+            context["mentionedJid"] = list(mentions)
+        if context:
+            extended["contextInfo"] = context
+        return [to, {"extendedTextMessage": extended}]
+    params = [to, {"text": text}]
+    if quoted:
+        params.append({"quoted": quoted})
+    if mentions:
+        params.append({"mentions": list(mentions)})
+    return params
+
+
+def _reaction_params(engine: str, key: dict, emoji: str, *, to=None) -> list:
+    """Positional params for a reaction, per engine.
+
+    Hypermeow types the reaction as its own protojson message kind; Baileys
+    nests it under ``react`` inside the message body.
+    """
+    chat = str(to or _jid_for_key(key) or "")
+    if not chat:
+        raise RuntimeError(
+            "send_reaction needs the target chat: pass 'to', or a 'key' that "
+            "carries remoteJid (the key from an inbound event has one)"
+        )
+    if _normalise_engine(engine) == "hypermeow":
+        return [chat, {"reactionMessage": {"text": emoji, "key": key}}]
+    return [chat, {"react": {"text": emoji, "key": key}}]
+
+
+def _media_payload(engine: str, *, to: str, kind: str, url: str,
+                   mimetype: str, caption=None, file_name=None,
+                   file_length=None) -> dict:
+    """The send-media body each engine expects.
+
+    hypermeow needs the media nested under its own protojson field and
+    requires ``fileLength``, which is the byte length of the media. We
+    cannot invent it; the caller may pass it, and when it is missing the
+    send is refused rather than sent into a guaranteed failure.
+    """
+    kind = str(kind or "").lower()
+    if _normalise_engine(engine) == "hypermeow":
+        field = _HYPERMEOW_MEDIA_FIELD.get(kind)
+        if field is None:
+            raise RuntimeError(
+                f"send_media: {kind!r} has no hypermeow message field "
+                f"(known: {sorted(set(_HYPERMEOW_MEDIA_FIELD))})"
+            )
+        if not file_length:
+            raise RuntimeError(
+                "send_media on a hypermeow connection requires file_length "
+                "(the byte size of the media). whatsmeow rejects the send "
+                "without it, and it cannot be derived here."
+            )
+        media = {"url": url, "mimetype": mimetype, "fileLength": int(file_length)}
+        if field == "audioMessage" and kind == "ptt":
+            media["ptt"] = True
+        if caption:
+            media["caption"] = caption
+        if file_name:
+            media["fileName"] = file_name
+        return [to, {field: media}]
+    # Baileys nests media under its own key per kind and wants the jid
+    # separately: [jid, {image: {...}}].
+    baileys_field = {"image": "image", "video": "video", "audio": "audio",
+                     "ptt": "audio", "document": "document"}.get(kind)
+    if baileys_field is None:
+        raise RuntimeError(f"send_media: unsupported kind {kind!r}")
+    media: dict = {"url": url, "mimetype": mimetype}
+    if caption:
+        media["caption"] = caption
+    if file_name:
+        media["fileName"] = file_name
+    return [to, {baileys_field: media}]
+
+
 def _transport_tools(host, storage: PluginStorage):
     """Outbound tools: connection lifecycle + WhatsApp writes.
 
@@ -1043,7 +1266,11 @@ def _transport_tools(host, storage: PluginStorage):
 
     async def _request(client, cid: str, method: str, params: dict):
         """POST /connections/request — the one endpoint every call funnels
-        through, matching whats2api's Baileys/whatsmeow RPC surface."""
+        through, matching whats2api's Baileys/whatsmeow RPC surface.
+
+        ``method`` must already be resolved for the connection's engine:
+        the two engines do not share names (see ``_ENGINE_METHODS``).
+        """
         r = await client.post(
             "/connections/request",
             json={"connectionId": cid, "method": method, "params": params},
@@ -1056,8 +1283,7 @@ def _transport_tools(host, storage: PluginStorage):
     async def _list_connections(client, args, host):
         r = await client.get("/connections")
         r.raise_for_status()
-        data = r.json()
-        return _ok(data if isinstance(data, list) else {"connections": data})
+        return _ok(_unpack_connections(r.json()))
 
     async def _get_connection(client, cid, args, host):
         r = await client.get(f"/connections/{cid}")
@@ -1122,11 +1348,18 @@ def _transport_tools(host, storage: PluginStorage):
                 "status_code": r.status_code,
                 "connection_count": 0,
             })
-        connections = data if isinstance(data, list) else []
+        connections = _unpack_connections(data)
         return _ok({
             "healthy": r.status_code < 400,
             "status_code": r.status_code,
             "connection_count": len(connections),
+            "connections": [
+                {"id": c.get("_id") or c.get("id"),
+                 "name": c.get("name"),
+                 "engine": _normalise_engine(c.get("engine")),
+                 "status": c.get("status")}
+                for c in connections
+            ],
         })
 
     # ── Messaging ───────────────────────────────────────────────────────
@@ -1138,12 +1371,12 @@ def _transport_tools(host, storage: PluginStorage):
             return _err("send_message requires 'to' (the recipient remote_jid)")
         if text is None:
             return _err("send_message requires 'text'")
-        params = {"to": to, "text": text}
-        if args.get("quoted"):
-            params["quoted"] = args["quoted"]
-        if args.get("mentions"):
-            params["mentions"] = args["mentions"]
-        data = await _request(client, cid, "sendMessage", params)
+        engine = await _engine_for(client, cid)
+        params = _text_params(
+            engine, to, text,
+            quoted=args.get("quoted"), mentions=args.get("mentions"),
+        )
+        data = await _request(client, cid, _method_for(engine, "send_text"), params)
         try:
             dispatch_via_event_bus(
                 "whats2api.message.sent",
@@ -1152,6 +1385,7 @@ def _transport_tools(host, storage: PluginStorage):
                     "connection_id": cid,
                     "to": to,
                     "text": text,
+                    "engine": engine,
                     "result": data,
                 },
             )
@@ -1163,8 +1397,15 @@ def _transport_tools(host, storage: PluginStorage):
         key = args.get("key")
         if not key:
             return _err("send_reaction requires 'key' (the message key to react to)")
-        params = {"key": key, "text": args.get("text") or ""}
-        return _ok(await _request(client, cid, "sendReaction", params))
+        engine = await _engine_for(client, cid)
+        try:
+            params = _reaction_params(engine, key, args.get("text") or "",
+                                      to=args.get("to"))
+        except RuntimeError as e:
+            return _err(str(e))
+        return _ok(await _request(
+            client, cid, _method_for(engine, "send_reaction"), params,
+        ))
 
     async def _mark_read(client, cid, args, host):
         chat = args.get("chat")
@@ -1175,9 +1416,14 @@ def _transport_tools(host, storage: PluginStorage):
             return _err("mark_read requires 'ids' (a non-empty list of message ids)")
         if isinstance(ids, str):
             ids = [ids]
-        return _ok(await _request(client, cid, "readMessages", {
-            "chat": chat, "ids": list(ids),
-        }))
+        engine = await _engine_for(client, cid)
+        body = {"chat": chat, "ids": list(ids)}
+        # hypermeow's MarkRead takes one struct; Baileys' readMessages takes
+        # the chat and the ids as separate positional arguments.
+        params = [body] if engine == "hypermeow" else [chat, list(ids)]
+        return _ok(await _request(
+            client, cid, _method_for(engine, "mark_read"), params,
+        ))
 
     async def _send_media(client, cid, args, host):
         to = args.get("to")
@@ -1191,21 +1437,29 @@ def _transport_tools(host, storage: PluginStorage):
         ]
         if missing:
             return _err("send_media requires " + ", ".join(missing))
-        params = {
-            "to": to, "kind": kind, "url": url, "mimetype": mimetype,
-        }
-        if args.get("caption"):
-            params["caption"] = args["caption"]
-        if args.get("file_name"):
-            params["fileName"] = args["file_name"]
-        return _ok(await _request(client, cid, "sendMediaMessage", params))
+        engine = await _engine_for(client, cid)
+        try:
+            params = _media_payload(
+                engine, to=to, kind=kind, url=url, mimetype=mimetype,
+                caption=args.get("caption"),
+                file_name=args.get("file_name"),
+                file_length=args.get("file_length"),
+            )
+        except RuntimeError as e:
+            return _err(str(e))
+        return _ok(await _request(
+            client, cid, _method_for(engine, "send_media"), params,
+        ))
 
     async def _send_presence(client, cid, args, host):
+        engine = await _engine_for(client, cid)
         presence = args.get("presence") or "available"
-        params = {"presence": presence}
+        params = [presence] if engine == "hypermeow" else [presence]
         if args.get("to"):
-            params["to"] = args["to"]
-        return _ok(await _request(client, cid, "sendPresenceUpdate", params))
+            params.append(args["to"])
+        return _ok(await _request(
+            client, cid, _method_for(engine, "send_presence"), params,
+        ))
 
     async def _is_on_whatsapp(client, cid, args, host):
         phones = args.get("phones")
@@ -1213,8 +1467,13 @@ def _transport_tools(host, storage: PluginStorage):
             return _err("is_on_whatsapp requires 'phones' (a non-empty list)")
         if isinstance(phones, str):
             phones = [phones]
+        engine = await _engine_for(client, cid)
+        # One positional string per phone. The provider answers
+        # `cannot unmarshal object into Go value of type string` for both
+        # {"phones": [...]} and [[...]] -- only ["..."] is accepted.
         return _ok(await _request(
-            client, cid, "isOnWhatsApp", {"phones": list(phones)},
+            client, cid, _method_for(engine, "is_on_whatsapp"),
+            [str(p) for p in phones],
         ))
 
     async def _call_method(client, cid, args, host):
@@ -1282,6 +1541,8 @@ def _transport_tools(host, storage: PluginStorage):
         _spec("send_reaction", _with(cid_prop, {
             "key": {"type": "object", "description": "message key from a prior event"},
             "text": {"type": "string", "description": "the emoji; empty removes the reaction"},
+            "to": {"type": "string",
+                   "description": "target chat jid; taken from key.remoteJid when omitted"},
         }), ("key",), needs_cid=True),
         _spec("mark_read", _with(cid_prop, {
             "chat": {"type": "string", "description": "remote_jid to mark read"},
@@ -1296,6 +1557,12 @@ def _transport_tools(host, storage: PluginStorage):
             "mimetype": {"type": "string"},
             "caption": {"type": "string"},
             "file_name": {"type": "string"},
+            "file_length": {
+                "type": "integer",
+                "description": "byte size of the media; REQUIRED on a "
+                               "hypermeow connection (whatsmeow rejects the "
+                               "send without it)",
+            },
         }), ("to", "kind", "url", "mimetype"), needs_cid=True),
         _spec("send_presence", _with(cid_prop, {
             "presence": {"type": "string",
