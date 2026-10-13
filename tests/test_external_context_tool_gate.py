@@ -21,6 +21,7 @@ from tests.helpers.js_modules import email_library_paths
 import src.tool_capabilities as tool_capabilities
 from src.tool_capabilities import (
     KNOWN_CAPABILITY_TOOLS,
+    POST_EXTERNAL_BLOCKED_EFFECTS,
     ResultIntegrity,
     ToolEffect,
     ToolRunSecurityContext,
@@ -1578,3 +1579,59 @@ def test_authorized_document_stream_precedes_completed_update(monkeypatch):
     assert event_types.index("doc_stream_open") < event_types.index("doc_update")
     assert event_types.index("doc_stream_delta") < event_types.index("doc_update")
     assert event_types.index("doc_update") < event_types.index("tool_output")
+
+
+# --- Browser static reads must work on any server id -----------------------
+#
+# The classification was pinned to the `mcp__builtin_browser__` server id, so
+# the same static read on an operator-configured browser MCP was "unknown" and
+# the fail-high gate refused it. Static reads observe the page without driving
+# it, so they stay available after the page arms the gate -- on any server.
+
+
+@pytest.mark.parametrize("tool", [
+    "mcp__b3957978__browser_snapshot",
+    "mcp__b3957978__browser_take_screenshot",
+    "mcp__b3957978__browser_console_messages",
+    "mcp__b3957978__browser_network_requests",
+    "mcp__147e3854__browser_snapshot",
+    "mcp__builtin_browser__browser_snapshot",
+])
+def test_browser_static_read_is_known_on_any_server(tool):
+    capabilities = capabilities_for_tool(tool)
+    assert capabilities.known, tool
+    assert not (capabilities.effects & POST_EXTERNAL_BLOCKED_EFFECTS), tool
+
+
+@pytest.mark.parametrize("tool", [
+    "mcp__b3957978__browser_navigate",
+    "mcp__b3957978__browser_click",
+    "mcp__b3957978__browser_type",
+    "mcp__b3957978__browser_evaluate",
+    "mcp__147e3854__browser_navigate",
+])
+def test_browser_interactive_verbs_still_fail_high(tool):
+    """The injection invariant: an untrusted page must not steer the agent.
+
+    This is the guarantee the server-id pinning must not be widened past --
+    ``test_browser_mcp_result_taints_and_only_static_reads_remain_available``
+    pins it for the builtin server, and it has to hold for every server.
+    """
+    assert not capabilities_for_tool(tool).known, tool
+
+
+@pytest.mark.parametrize("tool", [
+    "bash", "write_file", "send_email", "manage_settings",
+    "mcp__evil__rm_rf_slash", "mcp__evil__manage_settings",
+    "mcp__whats2api__send_message", "mcp__evil__click_button",
+])
+def test_non_browser_mcp_tools_still_fail_high(tool):
+    if tool in KNOWN_CAPABILITY_TOOLS:
+        return
+    assert not capabilities_for_tool(tool).known, tool
+
+
+def test_operator_browser_static_read_is_admitted_after_external_context():
+    context = ToolRunSecurityContext(external_untrusted_context_seen=True)
+    decision = context.decision_for("mcp__b3957978__browser_snapshot")
+    assert decision.allowed, decision.reason

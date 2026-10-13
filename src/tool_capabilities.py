@@ -300,16 +300,32 @@ _BROWSER_MCP_READ_CAPABILITIES = _capabilities(
     ToolEffect.BROKERED_NETWORK_READ,
     result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
 )
-_BROWSER_MCP_READ_TOOLS = frozenset(
+_BROWSER_MCP_READ_TOOLS = frozenset({"private_browser", "youtube_tool"})
+
+# Static browser reads. These observe the page without driving it, so they
+# stay available after the page's own content has armed the untrusted-context
+# gate. Matched on the bare verb rather than the qualified name: pinning them
+# to `mcp__builtin_browser__` meant the same read on an operator-configured
+# browser MCP was "unknown" and got refused, which is the bug. The set is
+# deliberately static-only — interactive verbs (click/type/navigate) stay
+# unclassified so the gate keeps refusing them once untrusted content is in
+# context, which is what stops an injected page from steering the agent.
+_BROWSER_MCP_STATIC_READ_VERBS = frozenset(
     {
-        "private_browser",
-        "youtube_tool",
-        "mcp__builtin_browser__browser_console_messages",
-        "mcp__builtin_browser__browser_network_requests",
-        "mcp__builtin_browser__browser_snapshot",
-        "mcp__builtin_browser__browser_take_screenshot",
+        "browser_console_messages",
+        "browser_network_requests",
+        "browser_snapshot",
+        "browser_take_screenshot",
     }
 )
+
+
+def is_browser_mcp_static_read(tool_name: Any) -> bool:
+    """Whether a tool takes a static read of a browser page, on any server."""
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    server, sep, verb = tool_name.rpartition("__")
+    return bool(sep) and server.startswith("mcp__") and verb in _BROWSER_MCP_STATIC_READ_VERBS
 
 # Capabilities an MCP server (or an OXS extension) explicitly declared for one
 # of its tools. Keyed by the qualified ``mcp__<server>__<tool>`` name.
@@ -378,7 +394,7 @@ def capabilities_for_tool(tool_name: Any) -> ToolCapabilities:
         capabilities = TOOL_CAPABILITIES.get(bare_name)
         if bare_name in BUILTIN_EMAIL_TOOLS and capabilities is not None:
             return capabilities
-    if tool_name in _BROWSER_MCP_READ_TOOLS:
+    if is_browser_mcp_static_read(tool_name):
         return _BROWSER_MCP_READ_CAPABILITIES
     declared = _MCP_DECLARED_CAPABILITIES.get(tool_name)
     if declared is not None:
