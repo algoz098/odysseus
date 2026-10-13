@@ -9202,6 +9202,29 @@ def _host_bridge_failure_response() -> str:
     )
 
 
+def _enabled_external_browser_mcp() -> bool:
+    """Whether an operator-configured browser MCP is connected and enabled.
+
+    The in-container ``builtin_browser`` does not count: it is bound by the
+    same page-authority rules as private_browser, so it must not be able to
+    re-open a turn that private_browser's absence closed.
+    """
+    try:
+        from src.mcp_manager import get_mcp_manager as _get_mcp_manager
+        _disabled_map = _load_mcp_disabled_map() or {}
+        for _tool in _get_mcp_manager().get_all_tools(_disabled_map):
+            _server_id = str(_tool.get("server_id") or "")
+            if not _server_id or _server_id == "builtin_browser":
+                continue
+            if _tool.get("is_disabled"):
+                continue
+            if str(_tool.get("name") or "").startswith("browser_"):
+                return True
+    except Exception as exc:
+        logger.debug("Failed to probe for an external browser MCP: %s", exc)
+    return False
+
+
 def _web_search_unavailable_for_turn(
     intent_domains: Set[str],
     disabled_tools: Set[str],
@@ -9230,8 +9253,14 @@ def _web_search_unavailable_for_turn(
         return False
     # Private-browser navigation is independent of the optional public-search
     # toggle. Let an explicit browser action reach its available tool.
+    # An operator-configured browser MCP is the same kind of resource: it owns
+    # its own transport and is not covered by the public-search toggle, so an
+    # explicit browser action must reach it too.
     if (
-        "private_browser" not in set(disabled_tools or ())
+        (
+            "private_browser" not in set(disabled_tools or ())
+            or _enabled_external_browser_mcp()
+        )
         and (
             _parse_explicit_private_browser_inspection(text)
             or _looks_like_explicit_browser_interaction(text)
