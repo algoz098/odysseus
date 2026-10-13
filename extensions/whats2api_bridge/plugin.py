@@ -169,6 +169,15 @@ when an interval needs more context.
 | New contact / phone / handle                   | `manage_memory`    |
 | Plan or arrangement agreed in the chat, however casual | `manage_notes` (plus `manage_calendar` when it has a resolvable day) |
 
+**Every `manage_tasks` call MUST pass `"source_capabilities": ["messaging_read"]`.**
+The task prompt you write names the people and the subject, not the channel —
+"Pedido do grupo Time Comercial: revisar o contrato do fornecedor" says nothing
+about WhatsApp. A task is authorized from its own prompt alone, so without this
+argument it starts with no WhatsApp access and every later call to the bridge
+comes back refused. The argument grants read-only access to the bridge this task
+came from; it cannot grant anything this session does not already have, and it
+can never grant write access to the account.
+
 **A casual plan is still content.** "Amanhã vamos tomar sorvete" is an
 arrangement someone made with the operator — it belongs in a note. Treating it
 as noise loses it forever, because the interval is sealed once judged.

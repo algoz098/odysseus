@@ -54,7 +54,57 @@ FAMILY_TOOLS = {
         "mcp__oxs_whats2api_bridge__list_events",
         "mcp__oxs_whats2api_bridge__list_connections_local",
     }),
+    # Read-only half of the messaging surface. A conversation *analyzer*
+    # consumes chats and persists findings elsewhere; it never acts on the
+    # account. Splitting the family lets such a task declare the capability
+    # it actually has: the analyzer's own prompt says "you NEVER reply on
+    # WhatsApp", and before this split that rule was only kept because the
+    # hardcoded literal happened to list no write tools. Once MCP grants are
+    # resolved from the live server (see ``live_tools_for_servers``) that
+    # accident is gone, so the read half has to be declarable on its own.
+    #
+    # Fail-closed by construction: a read-only capability admits exactly the
+    # names listed here and is never widened from the live inventory, so a
+    # bridge that ships a new write tool cannot leak into a read-only task
+    # until it is classified here.
+    "messaging_read": frozenset({
+        "mcp__whats2api__list_connections",
+        "mcp__whats2api__get_connection",
+        "mcp__whats2api__is_on_whatsapp",
+        "mcp__oxs_whats2api_bridge__get_analysis_queue",
+        "mcp__oxs_whats2api_bridge__list_messages",
+        "mcp__oxs_whats2api_bridge__get_message",
+        "mcp__oxs_whats2api_bridge__list_events",
+        "mcp__oxs_whats2api_bridge__list_connections_local",
+    }),
 }
+
+# Families that grant a capability without ever being widened from the live
+# MCP inventory. The read-only messaging surface is declared verbatim.
+#
+# A task may only declare one of these as its source capability: naming a
+# write-capable family in a task prompt would be the model granting itself an
+# integration, so the read-only split is the only provenance accepted.
+READ_ONLY_FAMILIES = frozenset({"messaging_read"})
+
+# The full surface each read-only family belongs to. Carrying the full family
+# alongside a read-only one is an explicit request for the whole capability.
+_FULL_FAMILY_OF = {"messaging_read": "messaging"}
+
+
+def allows_live_mcp_expansion(families) -> bool:
+    """Whether a granted family set may be widened by the live MCP inventory.
+
+    Read-only capabilities are declared verbatim and stay that way: widening
+    them from the server would hand a conversation reader whatever write tools
+    the bridge happens to expose.
+    """
+    granted = set(families or ())
+    return not any(
+        family in granted and _FULL_FAMILY_OF.get(family) not in granted
+        for family in READ_ONLY_FAMILIES
+    )
+
 
 # Retrieval is selection, not authorization. A normal agent turn must retain
 # this small recovery surface when no family was recognized; explicit family

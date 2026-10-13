@@ -1034,7 +1034,9 @@ FUNCTION_TOOL_SCHEMAS = [
                     "trigger_event": {"type": "string", "enum": ["session_created", "message_sent", "document_created", "memory_added", "research_completed", "email_received", "skill_added"],
                                       "description": "Event name (for trigger_type=event)"},
                     "trigger_count": {"type": "integer", "description": "Fire every N events (for trigger_type=event)"},
-                    "output_target": {"type": "string", "description": "Where results go. Defaults to 'session' (results land in a dedicated chat session the user reads) — this is the right choice for 'summarize for me' / 'send to me'. Do NOT go hunting for the user's email address; only use an email MCP tool name here if the user explicitly asked to be emailed AND an address is already known."}
+                    "output_target": {"type": "string", "description": "Where results go. Defaults to 'session' (results land in a dedicated chat session the user reads) — this is the right choice for 'summarize for me' / 'send to me'. Do NOT go hunting for the user's email address; only use an email MCP tool name here if the user explicitly asked to be emailed AND an address is already known."},
+                    "source_capabilities": {"type": "array", "items": {"type": "string", "enum": ["messaging_read"]},
+                                            "description": "Only for action=create/task_type=llm, and only when this task is derived from a source the prompt cannot name (e.g. a task extracted from a WhatsApp conversation). Use 'messaging_read' so the task can still read that conversation. Pass nothing when the prompt already names the source. This can never grant more than the current session already has."}
                 },
                 "required": ["action"]
             }

@@ -20,7 +20,7 @@ from src.agent_runtime.resources import (
 )
 from src.tool_policy import ToolPolicy, build_effective_tool_policy
 from src.turn_contract import (
-    FAMILY_TOOLS, canonical_tool, requested_capabilities,
+    FAMILY_TOOLS, allows_live_mcp_expansion, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
 )
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # request could name ("notes", "calendar", …). ``selected_tools_for_request``
 # can only narrow by literal tool name, and an integration is usually reached
 # by its brand ("WhatsApp") instead — so these must survive narrowing.
-_TOOL_ONLY_FAMILIES = frozenset({"messaging"})
+_TOOL_ONLY_FAMILIES = frozenset({"messaging", "messaging_read"})
 
 # Always-on request tools. These carry no product intent — they are the
 # agent's way to ask the user a question or record a plan — so a narrowed
@@ -497,7 +497,7 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
         tools = {canonical_tool(operation.tool)}
     else:
         operation = None
-    tools |= _live_mcp_tools_for(tools)
+    tools |= _live_mcp_tools_for(tools) if allows_live_mcp_expansion(families) else set()
     grants = []
     for name in sorted(tools | _UNIVERSAL_GRANT_TOOLS):
         name = canonical_tool(name)
@@ -631,10 +631,19 @@ def task_operation(task_type, action, prompt):
     return None
 
 
-def seal_task_authority(prompt, task_type, action, *, owner=None, parent_authority=MISSING_AUTHORITY):
-    """Only direct ingress grants; a model-created task is capped by its parent."""
+def seal_task_authority(prompt, task_type, action, *, owner=None, parent_authority=MISSING_AUTHORITY,
+                        capabilities=None):
+    """Only direct ingress grants; a model-created task is capped by its parent.
+
+    ``capabilities`` records where a task came from when its own prose cannot
+    say so — an analyzer that mints tasks out of a WhatsApp conversation
+    writes prompts like "send the licence count to Time Comercial", which name
+    neither the integration nor a product family. The claim is not trusted on
+    its own: the result is intersected with the creating turn below, so a
+    declared capability can only preserve a capability that turn already had.
+    """
     operation = task_operation(task_type, action, prompt)
-    authority = create_request_authority(str(prompt or ""), owner=owner)
+    authority = create_request_authority(str(prompt or ""), owner=owner, capabilities=capabilities)
     if operation is not None:
         authority = replace(authority, grants=(OperationGrant(operation.tool,
             inputs=frozenset({operation.input})),))

@@ -488,13 +488,27 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
             name = args.get("name") or (args.get("prompt") or args.get("action_name") or "Task")[:50]
             from src.agent_runtime.authority import seal_task_authority
 
+            # A task derived from a conversation can be given the source
+            # capability it cannot state in its own prompt. Only read-only
+            # families are accepted, and the result is intersected with the
+            # creating turn by ``seal_task_authority`` — so this can neither
+            # escalate nor hand a write surface to a task that only reads.
+            from src.turn_contract import READ_ONLY_FAMILIES
+            source_capabilities = args.get("source_capabilities")
+            if isinstance(source_capabilities, str):
+                source_capabilities = [source_capabilities]
+            if not isinstance(source_capabilities, (list, tuple, set, frozenset)):
+                source_capabilities = ()
+            source_capabilities = frozenset(source_capabilities) & READ_ONLY_FAMILIES
+
             task = ScheduledTask(
                 id=task_id,
                 owner=owner,
                 name=name,
                 prompt=args.get("prompt"),
                 request_authority_json=seal_task_authority(
-                    args.get("prompt"), task_type, args.get("action_name"), owner=owner),
+                    args.get("prompt"), task_type, args.get("action_name"), owner=owner,
+                    capabilities=source_capabilities),
                 task_type=task_type,
                 action=args.get("action_name"),
                 schedule=args.get("schedule", "daily") if trigger_type == "schedule" else None,

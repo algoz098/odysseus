@@ -727,3 +727,76 @@ def test_live_server_scoping_ignores_unrelated_mcp_servers(monkeypatch):
     auth = create_request_authority("whatsapp: manda o relatorio",
                                     owner="alice", session_id="s", workspace="")
     assert not permits(auth, "mcp__filesystem__write_file")
+
+
+# --- Read-only messaging capability ---------------------------------------
+#
+# A conversation analyzer consumes chats and persists findings elsewhere; it
+# never acts on the account. Once MCP grants resolve from the live server,
+# "messaging" covers whatever the bridge exposes, write tools included, so a
+# read-only consumer needs a declarable half.
+
+BRIDGE_READS = ("get_analysis_queue", "list_messages", "get_message",
+                "list_events", "list_connections_local")
+BRIDGE_WRITES = ("send_message", "send_media", "mark_read", "send_reaction",
+                 "call_method", "create_connection")
+
+
+@pytest.fixture
+def full_bridge(monkeypatch):
+    """A bridge exposing reads *and* writes."""
+    import src.mcp_manager as mcp
+    tools = [_tool("oxs_whats2api_bridge", n) for n in BRIDGE_READS + BRIDGE_WRITES]
+    monkeypatch.setattr(mcp, "get_mcp_manager",
+                        lambda: SimpleNamespace(get_all_tools=lambda dm=None: list(tools)))
+    monkeypatch.setattr(mcp, "disabled_map_from_db", lambda: {})
+    return mcp
+
+
+def q(name):
+    return f"mcp__oxs_whats2api_bridge__{name}"
+
+
+ANALYZER_TURN = "You are the WhatsApp Conversation Analyzer. You NEVER reply on WhatsApp."
+BRANDLESS_TASK = "Número final de licenças — enviar ao Time Comercial até amanhã"
+
+
+def test_full_messaging_family_reaches_the_whole_live_bridge(full_bridge):
+    """Naming the integration still means the whole capability, reads and writes."""
+    auth = create_request_authority(ANALYZER_TURN, owner="alice", session_id="s", workspace="")
+    assert all(permits(auth, q(n)) for n in BRIDGE_READS)
+    assert all(permits(auth, q(n)) for n in BRIDGE_WRITES)
+
+
+def test_read_only_family_grants_reads_and_never_writes(full_bridge):
+    """messaging_read is the analyzer's surface: consume, never act."""
+    auth = create_request_authority(BRANDLESS_TASK, owner="alice", session_id="s",
+                                   workspace="", capabilities={"messaging_read"})
+    assert all(permits(auth, q(n)) for n in BRIDGE_READS)
+    assert not any(permits(auth, q(n)) for n in BRIDGE_WRITES)
+
+
+def test_read_only_family_is_not_widened_by_the_live_inventory(monkeypatch):
+    """A live write tool the declaration does not name must not leak in."""
+    import src.mcp_manager as mcp
+    tools = [_tool("oxs_whats2api_bridge", n) for n in BRIDGE_READS + ("brand_new_write_op",)]
+    monkeypatch.setattr(mcp, "get_mcp_manager",
+                        lambda: SimpleNamespace(get_all_tools=lambda dm=None: list(tools)))
+    monkeypatch.setattr(mcp, "disabled_map_from_db", lambda: {})
+    auth = create_request_authority(BRANDLESS_TASK, owner="alice", session_id="s",
+                                   workspace="", capabilities={"messaging_read"})
+    assert permits(auth, q("get_analysis_queue"))
+    assert not permits(auth, q("brand_new_write_op"))
+
+
+def test_a_task_capability_cannot_escalate_past_its_creating_turn(full_bridge):
+    """Declared provenance is capped by the turn that declared it."""
+    parent = create_request_authority("Notes about my week", owner="alice",
+                                      session_id="s", workspace="")
+    with bind_request_authority(parent):
+        snapshot = seal_task_authority("do a thing", "llm", None, owner="alice",
+                                       capabilities={"messaging_read"})
+    child = restore_task_authority(snapshot, "do a thing", "llm", None,
+                                   owner="alice", session_id="s")
+    assert not permits(child, q("get_analysis_queue"))
+    assert not permits(child, "bash")
