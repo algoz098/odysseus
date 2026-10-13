@@ -27,11 +27,70 @@ def get_mcp_manager() -> "McpManager":
         _singleton = McpManager()
     return _singleton
 
+
 from src.runtime_paths import get_app_root
 
 logger = logging.getLogger(__name__)
 
 BROWSER_MCP_SERVER_ID = "builtin_browser"
+
+
+def disabled_map_from_db() -> Dict[str, set]:
+    """Return the per-server set of tool names an operator switched off.
+
+    Single source of truth for the ``disabled_map`` shape accepted by
+    :meth:`McpManager.get_all_tools` and ``get_all_openai_schemas``. Tool
+    surfaces live in several modules (the agent loop, the request-authority
+    grant builder); each used to load this map itself, so an admin's
+    "disabled tools" selection could be honoured in one surface and silently
+    ignored in another.
+    """
+    disabled_map: Dict[str, set] = {}
+    db = SessionLocal()
+    try:
+        for srv in db.query(McpServer).all():
+            if srv.disabled_tools:
+                try:
+                    names = json.loads(srv.disabled_tools)
+                except (json.JSONDecodeError, TypeError):
+                    names = None
+                if names:
+                    disabled_map[srv.id] = set(names)
+    finally:
+        db.close()
+    return disabled_map
+
+
+def live_tools_for_servers(server_ids, disabled_map: Optional[Dict[str, set]] = None) -> set:
+    """Return the qualified names a set of MCP servers actually exposes now.
+
+    Tool names are chosen by each server's own release, so a capability
+    declared as a literal name (see ``FAMILY_TOOLS``) drifts the moment a
+    server is renamed, gains a tool or drops one. Granting by *server*
+    instead keeps the declaration about the capability while letting the
+    live inventory decide the exact names.
+
+    Tools an operator disabled stay disabled, and the in-container
+    ``builtin_browser`` is never returned: it is bound by the page-authority
+    rules in the agent runtime, not by a semantic family.
+    """
+    wanted = {str(s) for s in (server_ids or ()) if s and str(s) != BROWSER_MCP_SERVER_ID}
+    if not wanted:
+        return set()
+    try:
+        manager = get_mcp_manager()
+        discovered = manager.get_all_tools(disabled_map or disabled_map_from_db())
+    except Exception as exc:  # a disconnected server must not deny the turn
+        logger.debug("Failed to resolve live MCP tools for %s: %s", sorted(wanted), exc)
+        return set()
+    return {
+        str(tool.get("qualified_name"))
+        for tool in discovered
+        if str(tool.get("server_id") or "") in wanted
+        and tool.get("qualified_name")
+        and not tool.get("is_disabled")
+    }
+
 
 # In-process MCP servers (OXS extensions) need a stable sentinel for the
 # ``self._sessions.get(server) is record[2]`` check in ``resource_identity``

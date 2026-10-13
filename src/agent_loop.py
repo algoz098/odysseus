@@ -7002,21 +7002,8 @@ def _web_fetch_summary_from_tool_output(raw: str) -> str:
 
 def _load_mcp_disabled_map() -> Dict[str, set]:
     """Load per-server disabled tool sets from the database."""
-    from core.database import McpServer, SessionLocal
-    disabled_map: Dict[str, set] = {}
-    db = SessionLocal()
-    try:
-        for srv in db.query(McpServer).all():
-            if srv.disabled_tools:
-                try:
-                    names = json.loads(srv.disabled_tools)
-                    if names:
-                        disabled_map[srv.id] = set(names)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-    finally:
-        db.close()
-    return disabled_map
+    from src.mcp_manager import disabled_map_from_db
+    return disabled_map_from_db()
 
 # System prompt that tells the LLM about available tools.
 # Always injected — the LLM decides whether to use them.

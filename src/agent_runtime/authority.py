@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from functools import wraps
 from inspect import signature
 import json
+import logging
 from pathlib import Path
 import re
 from uuid import uuid4
@@ -22,6 +23,8 @@ from src.turn_contract import (
     FAMILY_TOOLS, canonical_tool, requested_capabilities,
     RequiredReadOperation, required_read_operation_for_request, selected_tools_for_request,
 )
+
+logger = logging.getLogger(__name__)
 
 # Families whose tools are integrations rather than a primary product the
 # request could name ("notes", "calendar", …). ``selected_tools_for_request``
@@ -404,6 +407,47 @@ def interpret_request(request_text, *, history=(), workspace=None, active_docume
     return SemanticIntent(families, selected, required_read_operation_for_request(request_text, history))
 
 
+def _mcp_server_id(tool_name: str) -> str:
+    """The server segment of a qualified ``mcp__<server>__<tool>`` name."""
+    parts = str(tool_name or "").split("__")
+    return parts[1] if len(parts) >= 3 and parts[0] == "mcp" else ""
+
+
+def _live_mcp_tools_for(tools) -> set:
+    """Widen a granted capability to the tools its MCP servers expose now.
+
+    ``FAMILY_TOOLS`` declares a capability as literal tool names, because a
+    family has to be recognizable from request text alone. Names, however,
+    are chosen by each server's own release: a bridge that ships a new tool,
+    renames one, or serves a different tool set than the hardcoded list is
+    then a capability the agent is *offered* (the model sees the live schema)
+    but can never *execute* — every call comes back
+    ``request_authority_denied`` at ``execute_tool_block``.
+
+    Resolving by server keeps the declaration about the capability ("this
+    request may reach WhatsApp") while the live inventory decides the exact
+    names, so an extension that adds a tool stops needing a release here.
+    The declared literals stay in the grant set: they are the SDK-declared
+    capability, and a server that is momentarily disconnected must not shrink
+    an already-granted family.
+
+    Scope is deliberately narrow — only servers the granted set already
+    names are resolved, so this can never admit an unrelated integration the
+    request never asked for, and it stays out of the way of the family
+    narrowing above.
+    """
+    server_ids = {_mcp_server_id(name) for name in tools}
+    server_ids.discard("")
+    if not server_ids:
+        return set()
+    try:
+        from src.mcp_manager import live_tools_for_servers
+        return live_tools_for_servers(server_ids)
+    except Exception as exc:  # never turn a discovery failure into a denial
+        logger.debug("Failed to widen grants to live MCP tools: %s", exc)
+        return set()
+
+
 def create_request_authority(request_text, *, owner=None, session_id=None, workspace=None,
                              history=(), policy=None, active_document=False,
                              image_attachment=False, capabilities=None, client_runtime_context=None):
@@ -453,6 +497,7 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
         tools = {canonical_tool(operation.tool)}
     else:
         operation = None
+    tools |= _live_mcp_tools_for(tools)
     grants = []
     for name in sorted(tools | _UNIVERSAL_GRANT_TOOLS):
         name = canonical_tool(name)

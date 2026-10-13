@@ -614,3 +614,116 @@ async def test_authority_denial_cannot_create_completion_receipt(monkeypatch):
     assert journal.actions[0].execution_id is None
     assert journal.actions[0].outcome["authoritative"] is False
     assert journal.actions[0].outcome["blocked"] is True
+
+
+# --- Live-server grants for MCP capabilities -------------------------------
+#
+# A capability family declares literal tool names because it has to be
+# recognizable from request text alone. Those names drift: a server that
+# ships or renames a tool leaves the agent *offered* a live schema it can
+# never *execute*, and every call returns request_authority_denied at
+# execute_tool_block. Grants must resolve by server against the live
+# inventory while the declared literals keep working.
+
+def _tool(server_id, name, disabled=False):
+    return {"server_id": server_id, "name": name,
+            "qualified_name": f"mcp__{server_id}__{name}", "is_disabled": disabled}
+
+
+BRIDGE_LIVE = [
+    _tool("oxs_whats2api_bridge", n) for n in (
+        "get_analysis_queue", "list_messages", "get_message", "list_events",
+        "list_connections_local", "send_message", "send_media", "mark_read",
+        "send_reaction", "call_method", "health",
+    )
+] + [
+    _tool("oxs_whats2api_bridge", "wipe_everything", disabled=True),
+    _tool("builtin_browser", "browser_navigate"),
+]
+
+
+@pytest.fixture
+def live_bridge(monkeypatch):
+    """A connected WhatsApp bridge exposing its real tool surface."""
+    import src.mcp_manager as mcp
+    monkeypatch.setattr(mcp, "get_mcp_manager",
+                        lambda: SimpleNamespace(get_all_tools=lambda dm=None: list(BRIDGE_LIVE)))
+    monkeypatch.setattr(mcp, "disabled_map_from_db", lambda: {})
+    return mcp
+
+
+def permits(auth, tool_name, content="{}"):
+    return auth.permits(ExactOperation.normalize(tool_name, content))
+
+
+def test_live_mcp_tools_are_executable_not_merely_offered(live_bridge):
+    """Every enabled tool a live server exposes must be executable."""
+    auth = create_request_authority(
+        "Send the report to the Time Comercial group on WhatsApp",
+        owner="alice", session_id="s", workspace="")
+    # Names absent from the hardcoded FAMILY_TOOLS literal.
+    for tool in ("mcp__oxs_whats2api_bridge__send_message",
+                 "mcp__oxs_whats2api_bridge__send_media",
+                 "mcp__oxs_whats2api_bridge__mark_read",
+                 "mcp__oxs_whats2api_bridge__call_method"):
+        assert permits(auth, tool), tool
+
+
+def test_declared_sdk_capabilities_survive_a_disconnected_server(monkeypatch):
+    """The SDK-declared literals stay granted when discovery fails or is empty."""
+    import src.mcp_manager as mcp
+
+    class Empty:
+        def get_all_tools(self, disabled_map=None):
+            return []
+
+    class Broken:
+        def get_all_tools(self, disabled_map=None):
+            raise RuntimeError("mcp unavailable")
+
+    declared = ("mcp__oxs_whats2api_bridge__get_analysis_queue",
+                "mcp__whats2api__send_message")
+    for manager in (Empty(), Broken()):
+        monkeypatch.setattr(mcp, "get_mcp_manager", lambda: manager)
+        monkeypatch.setattr(mcp, "disabled_map_from_db", lambda: {})
+        auth = create_request_authority("whatsapp: manda o relatorio",
+                                        owner="alice", session_id="s", workspace="")
+        for tool in declared:
+            assert permits(auth, tool), f"{tool} lost under {manager!r}"
+
+
+def test_operator_disabled_mcp_tool_is_not_granted(live_bridge):
+    """An admin's per-tool switch still wins over the live inventory."""
+    auth = create_request_authority("whatsapp: manda o relatorio",
+                                    owner="alice", session_id="s", workspace="")
+    assert not permits(auth, "mcp__oxs_whats2api_bridge__wipe_everything")
+
+
+def test_builtin_browser_is_never_granted_through_a_family(live_bridge):
+    """builtin_browser keeps its own page-authority rules, not family grants."""
+    auth = create_request_authority("whatsapp: manda o relatorio",
+                                    owner="alice", session_id="s", workspace="")
+    assert not permits(auth, "mcp__builtin_browser__browser_navigate")
+
+
+@pytest.mark.parametrize("message", [
+    "what is 2+2?",
+    "show my notes",
+    "run the tests in the repo",
+    "look up this contact",
+])
+def test_live_mcp_expansion_never_widens_beyond_the_requested_family(live_bridge, message):
+    """A request that implies no messaging capability gains no bridge tool."""
+    auth = create_request_authority(message, owner="alice", session_id="s", workspace="")
+    assert not permits(auth, "mcp__oxs_whats2api_bridge__send_message")
+
+
+def test_live_server_scoping_ignores_unrelated_mcp_servers(monkeypatch):
+    """Only servers the granted capability already names are resolved."""
+    import src.mcp_manager as mcp
+    monkeypatch.setattr(mcp, "get_mcp_manager", lambda: SimpleNamespace(
+        get_all_tools=lambda dm=None: [_tool("filesystem", "write_file")]))
+    monkeypatch.setattr(mcp, "disabled_map_from_db", lambda: {})
+    auth = create_request_authority("whatsapp: manda o relatorio",
+                                    owner="alice", session_id="s", workspace="")
+    assert not permits(auth, "mcp__filesystem__write_file")
