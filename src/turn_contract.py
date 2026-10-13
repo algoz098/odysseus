@@ -68,6 +68,13 @@ FAMILY_TOOLS = {
     # bridge that ships a new write tool cannot leak into a read-only task
     # until it is classified here.
     "messaging_read": frozenset({
+        "mcp__whats2api__list_chats",
+        "mcp__whats2api__list_messages",
+        "mcp__whats2api__get_contact",
+        "mcp__whats2api__get_group_info",
+        "mcp__whats2api__get_profile_picture",
+        "mcp__whats2api__list_joined_groups",
+        "mcp__whats2api__download_media",
         "mcp__whats2api__list_connections",
         "mcp__whats2api__get_connection",
         "mcp__whats2api__is_on_whatsapp",
@@ -76,6 +83,7 @@ FAMILY_TOOLS = {
         "mcp__oxs_whats2api_bridge__get_message",
         "mcp__oxs_whats2api_bridge__list_events",
         "mcp__oxs_whats2api_bridge__list_connections_local",
+        "mcp__oxs_whats2api_bridge__health",
     }),
 }
 

@@ -800,3 +800,34 @@ def test_a_task_capability_cannot_escalate_past_its_creating_turn(full_bridge):
                                    owner="alice", session_id="s")
     assert not permits(child, q("get_analysis_queue"))
     assert not permits(child, "bash")
+
+
+# The read surface must cover both WhatsApp sources a deployment can have:
+# the direct `whats2api` MCP and the in-process `oxs_whats2api_bridge`
+# extension. Listing only one leaves the other unreachable from a read-only
+# task, which is the failure this whole capability exists to prevent.
+WHATS2API_READS = ("list_chats", "list_messages", "get_contact", "get_group_info",
+                   "get_profile_picture", "list_joined_groups", "download_media",
+                   "list_connections", "get_connection", "is_on_whatsapp")
+BRIDGE_READS_EXT = ("get_analysis_queue", "list_messages", "get_message",
+                    "list_events", "list_connections_local", "health")
+WHATS2API_WRITES = ("send_message", "send_image", "send_document", "send_reaction",
+                    "send_presence", "mark_read", "delete_message", "leave_group",
+                    "set_about", "create_connection", "patch_connection",
+                    "remove_connection", "start_connection", "stop_connection")
+
+
+def test_read_only_family_covers_both_whatsapp_sources():
+    from src.turn_contract import FAMILY_TOOLS
+    declared = FAMILY_TOOLS["messaging_read"]
+    for name in WHATS2API_READS:
+        assert f"mcp__whats2api__{name}" in declared, name
+    for name in BRIDGE_READS_EXT:
+        assert f"mcp__oxs_whats2api_bridge__{name}" in declared, name
+
+
+def test_read_only_family_names_no_write_operation():
+    from src.turn_contract import FAMILY_TOOLS
+    declared = {n.rsplit("__", 1)[-1] for n in FAMILY_TOOLS["messaging_read"]}
+    for name in WHATS2API_WRITES:
+        assert name not in declared, name
