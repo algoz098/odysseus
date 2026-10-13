@@ -10,7 +10,7 @@ import re
 from contextlib import aclosing, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from functools import wraps
+from functools import lru_cache, wraps
 from inspect import signature
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -4447,6 +4447,18 @@ def canonical_tool(name: str) -> str:
     return name.rsplit("__", 1)[-1] if name.startswith("mcp__email__") else name
 
 
+@lru_cache(maxsize=1)
+def _contract_tracked_builtins() -> frozenset:
+    """Native tool names the turn contract's schema inventory can account for.
+
+    Used to tell an unknown integration's MCP tool (deferred to execution
+    policy) from a third-party server reusing a built-in verb (not the same
+    operation, so never deferred).
+    """
+    from src.tool_policy import known_tool_names
+    return frozenset(known_tool_names())
+
+
 def recently_executed_families(history: Iterable, *, user_turns: int = 6,
                                maximum: int = 3, include_failed_attempts: bool = False) -> tuple[str, ...]:
     """Return bounded, most-recent families proven by persisted tool events."""
@@ -6354,14 +6366,23 @@ class TurnContract:
 
     def permits(self, name: str) -> bool:
         raw = str(name or "")
-        # MCP tools are offered by the tool index + caller policy, not by the
-        # built-in turn contract (whose schema inventory covers core
-        # built-ins only). Execution-time checks still enforce tool policy
-        # and disabled lists after this gate, so MCP calls remain subject to
-        # user/server denials.
-        if raw.startswith("mcp__"):
+        canonical = canonical_tool(raw)
+        if canonical in {canonical_tool(n) for n in self.offered}:
             return True
-        return canonical_tool(raw) in {canonical_tool(n) for n in self.offered}
+        if not raw.startswith("mcp__"):
+            return False
+        # An MCP tool outside this contract's schema inventory is offered by
+        # the tool index rather than by the contract, so its policy is decided
+        # at execution. Deferring it here is what keeps a connected
+        # integration callable at all.
+        #
+        # But that deferral only covers tools this contract knows nothing
+        # about. When the bare verb is a built-in the inventory *does* track,
+        # the MCP name is a competing spelling of a known operation rather
+        # than an unknown integration: `mcp__other__send_email` is not the
+        # email capability, and deferring it would hand a denial for
+        # `send_email` an open door under a different server's name.
+        return raw.rsplit("__", 1)[-1] not in _contract_tracked_builtins()
 
     def schemas(self) -> list[dict]:
         # Return copies: compact/full model formatting must not mutate the contract.
