@@ -7915,14 +7915,30 @@ def _web_only_route_tools(text: str, disabled_tools: Set[str]) -> Set[str]:
     tools = set(WEB_TOOL_NAMES) | {"ask_user", "update_plan"}
     if _looks_like_youtube_tool_turn(text) and "youtube_tool" not in set(disabled_tools or set()):
         tools.add("youtube_tool")
-    if (
-        (
-            _looks_like_explicit_browser_interaction(text)
-            or _looks_like_map_browser_request(text)
-        )
-        and "private_browser" not in set(disabled_tools or set())
-    ):
+    browser_intent = bool(
+        _looks_like_explicit_browser_interaction(text)
+        or _looks_like_map_browser_request(text)
+    )
+    if browser_intent and "private_browser" not in set(disabled_tools or set()):
         tools.add("private_browser")
+    if browser_intent:
+        # A web-only turn is exactly where an operator-configured browser MCP
+        # must stay reachable. Without this the allowlist above drops every
+        # `mcp__*` schema, leaving the model with no browser at all once
+        # private_browser is disabled. Only enabled, non-builtin servers are
+        # admitted — a server the admin switched off stays switched off.
+        try:
+            from src.mcp_manager import get_mcp_manager as _get_mcp_manager
+            _disabled_map = _load_mcp_disabled_map() or {}
+            for _tool in _get_mcp_manager().get_all_tools(_disabled_map):
+                _server_id = str(_tool.get("server_id") or "")
+                if _server_id == "builtin_browser" or _tool.get("is_disabled"):
+                    continue
+                _qualified = _tool.get("qualified_name")
+                if _qualified:
+                    tools.add(str(_qualified))
+        except Exception as exc:
+            logger.debug("Failed to extend web-only tools with MCP browser tools: %s", exc)
     return tools
 
 _WORKSPACE_AGENT_TOOLS = (

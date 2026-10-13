@@ -1711,7 +1711,11 @@ async def execute_tool_block(
             return f"{transport}: UNSUPPORTED", page_unavailable()
     # Raw global Playwright MCP has no authoritative session/page observation.
     # Its transport process and remote backend identity cannot substitute for it.
-    if transport.startswith("mcp__") and transport.rsplit("__", 1)[-1] in {
+    # Scoped to the in-container builtin browser MCP only: an operator-configured
+    # remote MCP (e.g. a user-supplied Playwright MCP bound to a real browser via
+    # the Playwright Extension) is explicitly delegated authority and must stay
+    # reachable. Match on the qualified server id, never the bare verb.
+    if transport.startswith("mcp__builtin_browser__") and transport.rsplit("__", 1)[-1] in {
         "browser_click", "browser_fill_form", "browser_type", "browser_press_key", "browser_evaluate",
         "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_take_screenshot",
         "browser_wait_for", "browser_tabs", "browser_close", "browser_run_code", "browser_network_requests",
