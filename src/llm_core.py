@@ -625,8 +625,7 @@ def _clear_host_dead(url: str) -> None:
 # repeat calls to api.anthropic.com / api.openai.com / openrouter skip the
 # 100-500ms TCP+TLS handshake. Lazy init so we bind to the running event loop.
 _http_client: Optional[httpx.AsyncClient] = None
-import itertools as _it
-_request_dump_counter = _it.count()
+_request_dump_index = 0
 _http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=30, keepalive_expiry=30.0)
 
 # How many times one candidate may be re-issued after it returns an empty
@@ -3110,11 +3109,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         if os.getenv("ODYSSEUS_DUMP_REQUESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
             # Diagnostic: capture the exact bytes we put on the wire so a
             # provider-side empty stream can be replayed outside the app.
-            import itertools as _it
-            global _request_dump_counter
+            global _request_dump_index
             try:
-                _request_dump_counter = next(_request_dump_counter)
-                with open(f"/tmp/llm_req_{_request_dump_counter:04d}.json", "w",
+                _request_dump_index += 1
+                with open(f"/tmp/llm_req_{_request_dump_index:04d}.json", "w",
                           encoding="utf-8") as _fh:
                     json.dump({"url": target_url, "headers": h, "payload": payload}, _fh)
             except Exception:
