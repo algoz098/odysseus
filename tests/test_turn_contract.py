@@ -17,6 +17,7 @@ from src.turn_contract import (
     preserve_bound_editor_selected_tools, selected_tools_for_request,
     targets_bound_editor_request,
 )
+from src.agent_runtime.authority import ExactOperation
 
 
 def _completed_tool_turn(user_text, *tools):
@@ -4413,3 +4414,49 @@ def test_chinese_video_to_image_artifact_keeps_media_and_workspace_tools():
         "请完整浏览 /workspace/input/video.mp4，为每款零食截图并拼成清单图，"
         "输出到 /workspace/snack_checklist.jpg，交付前打开成品图检查。"
     ) == {"media_inspection", "shell_files"}
+
+
+# --- Product families must be reachable in the operator's own language ------
+#
+# A family is recognized from the request text alone, so its vocabulary is the
+# whole entry point. These were English-only, which made a product a
+# Portuguese-speaking user cannot spell unreachable however they phrased it:
+# "Certo e de email e calendario o que eu tenho de pendencias?" resolved to the
+# email family alone, ``manage_calendar`` was never offered, and the turn
+# contract refused the call as outside the turn's capabilities.
+
+@pytest.mark.parametrize(("message", "expected"), [
+    ("quais eventos vem ai?", {"calendar"}),
+    ("quais reunioes tenho?", {"calendar"}),
+    ("o que tenho de pendencias no calendario?", {"calendar", "tasks"}),
+    ("minhas pendencias", {"tasks"}),
+    ("cria uma tarefa pra mim", {"tasks"}),
+    ("quais notas eu salvei?", {"notes"}),
+    ("quais lembretes eu tenho?", {"notes"}),
+    ("quais emails tenho", {"email"}),
+    ("quais emails nao respondidos?", {"email"}),
+])
+def test_product_families_are_reachable_in_portuguese(message, expected):
+    assert expected <= set(requested_capabilities(message))
+
+
+@pytest.mark.parametrize(("message", "family", "tool"), [
+    ("o que tenho de pendencias no calendario?", "calendar", "manage_calendar"),
+    ("quais emails tenho", "email", "list_emails"),
+    ("minhas pendencias", "tasks", "manage_tasks"),
+    ("quais notas eu salvei?", "notes", "manage_notes"),
+])
+def test_portuguese_requests_grant_their_tool(message, family, tool):
+    from src.agent_runtime.authority import create_request_authority
+
+    authority = create_request_authority(message, owner="alice", session_id="s", workspace="")
+    assert family in {f for f in FAMILY_TOOLS if tool in FAMILY_TOOLS[f]}
+    assert authority.permits(ExactOperation.normalize(tool, "{}")), tool
+
+
+def test_portuguese_vocabulary_does_not_reach_shell_or_web():
+    """A synonym must not widen a request past the family it names."""
+    for message in ("minhas pendencias", "meus compromissos", "quais notas eu salvei"):
+        caps = set(requested_capabilities(message))
+        assert "shell_files" not in caps, message
+        assert "search_browser" not in caps, message

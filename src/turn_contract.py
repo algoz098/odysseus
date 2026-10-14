@@ -177,13 +177,23 @@ def _mentions_under_budget(text: str) -> bool:
                 return True
     return False
 _FAMILY_WORDS = {
-    "calendar": r"\b(?:calendar|calender|events?|appointments?|meetings?|agenda)\b",
-    "notes": r"\b(?:notes?|checklists?|groceries|remind\s+me)\b",
-    "tasks": r"\b(?:tasks?|todos?|schedul(?:ed|d)\s+jobs?|automations?)\b",
+    # A family is recognized from the request text alone, so its vocabulary is
+    # the whole entry point. These were English-only, which made a product that
+    # a Portuguese-speaking user cannot spell in English unreachable no matter
+    # how they phrase it: "e de email e calendario" resolved to the email
+    # family alone, ``manage_calendar`` was never offered, and the turn
+    # contract refused the call. The additions are synonyms for words already
+    # in the pattern -- they widen the languages a capability is reachable
+    # in, not the capabilities a request can reach.
+    "calendar": (r"\b(?:calendar|calender|events?|appointments?|meetings?|agenda|"
+                 r"calend[aá]rios?|eventos?|compromissos?|reuni[õo]es?)\b"),
+    "notes": r"\b(?:notes?|checklists?|groceries|remind\s+me|notas?|lembretes?)\b",
+    "tasks": (r"\b(?:tasks?|todos?|schedul(?:ed|d)\s+jobs?|automations?|"
+              r"tarefas?|pend[eê]ncias?)\b"),
     "skills": r"\bskills?\b",
     "memory": r"\b(?:memory|memories|memores|remember|forget|past\s+chats?|previous\s+conversations?)\b",
     "documents": r"\b(?:documents?|documets?|docs?|editor)\b",
-    "email": r"\b(?:emails?|inbox|mailbox|mail|spam)\b",
+    "email": r"\b(?:emails?|inbox|mailbox|mail|spam|caixa\s+de\s+entrada)\b",
     "search_browser": r"\b(?:search\s+(?:the\s+)?web|web|online|browse|browser|websites?|sites?|news|weather|youtube|arxiv|hugging\s*face)\b|https?://|\b\w+\.(?:com|org|net|io)\b",
     "shell_files": r"\b(?:files?|folders?|directory|shell|terminal|workspace|repo|repository|python|hostname|b?ssh|bash)\b",
     "cookbook_admin": r"\b(?:cookbo{1,2}k|endpoints?|models?|servers?|settings|integrations?)\b",
@@ -285,6 +295,19 @@ def _normalize_request_lead(value: str) -> str:
     text = re.sub(r"^quick\s*[,!:—–-]+\s*", "", text, flags=re.I)
     text = re.sub(r"^quick(?:ly)?\s+(?=(?:search|list|show|check|find|read|open)\b)", "", text, flags=re.I)
     text = re.sub(r"^((?:can|could|would|will)\s+)u\b", r"\1you", text, flags=re.I)
+    # Portuguese conversational wrappers. "Certo e de email e calendario..."
+    # is a real request behind an acknowledgment; leaving the filler in place
+    # anchors the lookup patterns past the request and the turn is classified
+    # as a question about the feature instead of a calendar read. Only
+    # Portuguese filler belongs here -- "show" is an English action verb, and
+    # a bare leading "e" is ordinary prose, not a wrapper.
+    text = re.sub(
+        r"^(?:certo|beleza|ent[aã]o|blz|vlw|obrigado|obg)\s*[,!.-]?\s+"
+        r"(?:e\s+(?:de|do|da|dos|das|em|para|sobre)\s+)?(?=\S)",
+        "",
+        text,
+        flags=re.I,
+    )
     text = re.sub(r"\boffical\b", "official", text, flags=re.I)
     return text
 
@@ -433,7 +456,18 @@ _LOOKUP = re.compile(
     r"(?:is|are)\s+there\s+(?:an?\s+)?(?:calendar\s+(?:thing|entry)|any\s+"
     r"(?:emails?|mail|events?|notes?|tasks?|documents?|files?))\b|"
     r"any\s+(?:emails?|mail|events?|notes?|tasks?|documents?|files?)\b|"
-    r"(?:do\s+i\s+have|have\s+i\s+got)\b)",
+    r"(?:do\s+i\s+have|have\s+i\s+got)\b|"
+    # Portuguese questions. Without this a request the operator writes in
+    # their own language reads as an explanatory question about the feature
+    # rather than a lookup, and ``_clause_capabilities`` returns nothing at
+    # all -- the family scan below it never even runs.
+    r"(?:quais?|quantos?)\s+(?:as?\s+|os?\s+)?"
+    r"(?:meus?\s+|minhas?\s+)?"
+    r"(?:emails?|mensagens?|agenda|calend[aá]rio|compromissos?|reuni[õo]es?|eventos?|"
+    r"tarefas?|pend[eê]ncias?|notas?|lembretes?)\b|"
+    r"(?:o\s+que\s+)?(?:eu\s+)?(?:tenho|ha|existe|possuo)\b[\s\S]{0,80}?"
+    r"\b(?:emails?|mensagens?|agenda|calend[aá]rio|compromissos?|reuni[õo]es?|eventos?|"
+    r"tarefas?|pend[eê]ncias?|notas?|lembretes?)\b)",
     re.I,
 )
 _PERSONAL_STORE_LOOKUP = re.compile(
@@ -443,7 +477,13 @@ _PERSONAL_STORE_LOOKUP = re.compile(
     r"(?:\b(?:my|our)\b|\bdo\s+(?:i|we)\s+have\b|\b(?:is|are)\s+saved\b)|"
     r"^\s*(?:does?|is|are)\s+any\s+"
     r"(?:notes?|documents?|docs?|memories|tasks?|skills?|emails?|events?)\b"
-    r"[\s\S]{0,180}\b(?:mention|contain|match|have|include)\b",
+    r"[\s\S]{0,180}\b(?:mention|contain|match|have|include)\b|"
+    # The Portuguese equivalents of the two forms above.
+    r"^\s*(?:por\s+favor\s+)?(?:olh[ae]|procur[ae]|veja|mostre|liste|acesse|consulte)\s+"
+    r"(?:minhas?\s+|meus?\s+|as?\s+|os?\s+)*"
+    r"(?:emails?|mensagens?|agenda|calend[aá]rio|notas?|tarefas?|pend[eê]ncias?)\b|"
+    r"^\s*(?:quais?|quantos?)\b[\s\S]{0,180}?"
+    r"(?:\b(?:meus?|minhas?)\b|\b(?:eu\s+)?tenho\b|\b(?:foi\s+)?salv[oa]\b)",
     re.I,
 )
 # Treat "schedule" as a calendar noun only when the wording makes that
