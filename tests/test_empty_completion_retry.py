@@ -159,3 +159,78 @@ def test_the_retry_is_opt_in_not_default():
         "the empty-completion retry must default to off so callers that did "
         "not ask for it keep the terminal-on-empty contract"
     )
+
+
+# --- The regression this file exists for ------------------------------------
+#
+# The first version of this retry was gated on ``fallback_on_empty`` as well
+# as its own opt-in. The foreground chat route sets that flag to False on
+# purpose (see ``ForegroundModelPolicy.fallback_on_empty``), so the retry was
+# dead in precisely the path that needed it: a chat turn against a single
+# endpoint still lost the whole request to an empty completion.
+
+@pytest.mark.asyncio
+async def test_retry_still_runs_when_fallback_on_empty_is_false(monkeypatch):
+    """The chat path: fallback_on_empty=False + retry opt-in must retry."""
+    calls = []
+
+    async def fake_candidate(*args, **kwargs):
+        body = _stream() if len(calls) < 1 else _stream(_text("pronto"))
+        calls.append(body)
+        for chunk in body.splitlines(keepends=True):
+            yield chunk
+
+    monkeypatch.setattr(llm_core, "_stream_candidate_with_context_recovery", fake_candidate)
+
+    out = []
+    async for chunk in llm_core.stream_llm_with_fallback(
+            [("https://api.example/v1", "m", {"Authorization": "k"})],
+            [{"role": "user", "content": "oi"}],
+            fallback_on_empty=False,
+            retry_empty_completion=True,
+    ):
+        out.append(chunk)
+
+    assert len(calls) == 2, "the retry must not be gated on fallback_on_empty"
+    assert any('"delta"' in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_fallback_on_empty_false_alone_still_means_no_retry(monkeypatch):
+    """Without the opt-in the foreground policy is untouched."""
+    calls = []
+
+    async def fake_candidate(*args, **kwargs):
+        body = _stream()
+        calls.append(body)
+        for chunk in body.splitlines(keepends=True):
+            yield chunk
+
+    monkeypatch.setattr(llm_core, "_stream_candidate_with_context_recovery", fake_candidate)
+
+    out = []
+    async for chunk in llm_core.stream_llm_with_fallback(
+            [("https://api.example/v1", "m", {"Authorization": "k"})],
+            [{"role": "user", "content": "oi"}],
+            fallback_on_empty=False,
+    ):
+        out.append(chunk)
+
+    assert len(calls) == 1
+    assert any("no substantive output" in c for c in out), out
+
+
+def test_the_agent_loop_opts_in():
+    """stream_agent_loop must ask for the retry; without it nothing retries."""
+    import inspect
+
+    import src.agent_loop as agent_loop
+
+    assert "retry_empty_completion=True" in inspect.getsource(agent_loop)
+
+
+def test_foreground_policy_leaves_fallback_on_empty_false():
+    """Documents why the retry must not be gated on that flag."""
+    from src.foreground_model_routing import ForegroundModelPolicy
+
+    assert ForegroundModelPolicy().fallback_on_empty is False

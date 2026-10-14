@@ -4735,18 +4735,23 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
         # verdict: MiniMax returns HTTP 200 with a stream carrying no text and
         # no tool call, and the turn dies before any tool runs.
         #
-        # Opt-in, and off by default. The fallback chain's contract is that an
-        # empty completion is terminal for a candidate and recovery means
-        # *switching* to another one; silently re-issuing a candidate would
-        # change that for every caller. What it does not cover is the
-        # single-endpoint deployment, where there is no other candidate to
-        # switch to and an empty completion is an immediate, unrecoverable
-        # turn failure. Callers that accept a repeated identical request turn
-        # this on explicitly.
+        # Opt-in, and off by default. Switching candidates remains the chain's
+        # recovery mechanism, and a caller that did not ask for this keeps
+        # terminal-on-empty. The only case covered here is the
+        # single-endpoint deployment, which has no other candidate to switch
+        # to and where an empty completion is an immediate turn failure.
+        #
+        # Deliberately NOT gated on `fallback_on_empty`. That flag governs
+        # whether the chain may *switch candidates* on an empty completion,
+        # and the foreground chat route sets it to False on purpose. Folding
+        # it in here made this retry dead in exactly the path that needs it:
+        # a chat turn on a single endpoint still lost the whole request.
+        # Re-issuing the candidate already in hand is a different mechanism
+        # and answers to its own opt-in.
         #
         # Safe to retry: `emitted` is false, so no token reached the client and
         # re-issuing cannot duplicate output.
-        if (retry_empty_completion and is_last and fallback_on_empty
+        if (retry_empty_completion and is_last
                 and empty_retries < _EMPTY_COMPLETION_RETRIES):
             empty_retries += 1
             logger.warning(
