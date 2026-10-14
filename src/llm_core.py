@@ -625,7 +625,6 @@ def _clear_host_dead(url: str) -> None:
 # repeat calls to api.anthropic.com / api.openai.com / openrouter skip the
 # 100-500ms TCP+TLS handshake. Lazy init so we bind to the running event loop.
 _http_client: Optional[httpx.AsyncClient] = None
-_request_dump_index = 0
 _http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=30, keepalive_expiry=30.0)
 
 # How many times one candidate may be re-issued after it returns an empty
@@ -633,12 +632,12 @@ _http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=30, k
 # a response is a provider blip, and the only other recovery was a *different*
 # candidate -- so a single-endpoint deployment had none at all. Safe to retry:
 # an empty completion streamed nothing, so re-issuing cannot duplicate tokens.
-_EMPTY_COMPLETION_RETRIES = 2
+_EMPTY_COMPLETION_RETRIES = 4
 
 # Backoff before re-issuing a candidate that returned an empty completion.
 # Instant retries landed inside the same rate-limit/pooled-connection window
 # and failed identically, three times in a row, before giving up.
-_EMPTY_COMPLETION_BACKOFF_SECONDS = (1.5, 4.0)
+_EMPTY_COMPLETION_BACKOFF_SECONDS = (1.5, 4.0, 8.0, 12.0)
 
 # When set, the next provider request uses a one-shot client with its own
 # connection instead of the process-wide keepalive pool. A reused connection
@@ -3106,17 +3105,6 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
-        if os.getenv("ODYSSEUS_DUMP_REQUESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
-            # Diagnostic: capture the exact bytes we put on the wire so a
-            # provider-side empty stream can be replayed outside the app.
-            global _request_dump_index
-            try:
-                _request_dump_index += 1
-                with open(f"/tmp/llm_req_{_request_dump_index:04d}.json", "w",
-                          encoding="utf-8") as _fh:
-                    json.dump({"url": target_url, "headers": h, "payload": payload}, _fh)
-            except Exception:
-                logger.exception("request dump failed")
 
     # Connect budget from LLMConfig.CONNECT_TIMEOUT (env LLM_CONNECT_TIMEOUT).
     # The dead-host cooldown still bounds a genuinely unreachable upstream, so a

@@ -332,3 +332,33 @@ def test_empty_completion_fallback_is_opt_in_per_owner(monkeypatch):
         })
 
     assert resolve_foreground_model_policy("alice").fallback_on_empty is True
+
+
+# --- Enough retries for a provider that empties about half the time -------
+#
+# MiniMax-M3 answers HTTP 200 with a one-character body on roughly half its
+# requests for a given payload, with no error and no moderation flag: the same
+# captured request replays successfully on the next attempt. At two retries a
+# turn still fell through to a different model a eighth of the time, which is
+# not a failure but it is not M3 either. Four retries take that to ~3% while
+# the worst case stays bounded by the backoff.
+
+def test_the_retry_budget_outlasts_a_half_rate_provider():
+    rate = 0.5
+    attempts = llm_core._EMPTY_COMPLETION_RETRIES + 1
+    assert 0.5 ** attempts < 0.05, (
+        f"{attempts} attempts at a {rate:.0%} empty rate still falls through "
+        f"{rate ** attempts:.1%} of the time"
+    )
+
+
+def test_the_backoff_covers_every_retry():
+    assert len(llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS) >= llm_core._EMPTY_COMPLETION_RETRIES
+    assert all(d > 0 for d in llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS)
+    assert list(llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS) == sorted(
+        llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS), "backoff must not shrink"
+
+
+def test_the_worst_case_stays_bounded():
+    total = sum(llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS[:llm_core._EMPTY_COMPLETION_RETRIES])
+    assert total < 60, f"a turn would stall {total:.0f}s before failing"
