@@ -48,12 +48,29 @@ FAMILY_TOOLS = {
         "mcp__whats2api__mark_read",
         "mcp__whats2api__send_presence",
         "mcp__whats2api__is_on_whatsapp",
-        "mcp__oxs_whats2api_bridge__get_analysis_queue",
-        "mcp__oxs_whats2api_bridge__list_messages",
-        "mcp__oxs_whats2api_bridge__get_message",
-        "mcp__oxs_whats2api_bridge__list_events",
-        "mcp__oxs_whats2api_bridge__list_connections_local",
-    }),
+         "mcp__oxs_whats2api_bridge__get_analysis_queue",
+         "mcp__oxs_whats2api_bridge__list_messages",
+         "mcp__oxs_whats2api_bridge__get_message",
+         "mcp__oxs_whats2api_bridge__list_events",
+         "mcp__oxs_whats2api_bridge__list_connections_local",
+         # The in-process bridge is a second server for the same capability,
+         # and it was declared with its read half only. Naming WhatsApp
+         # therefore granted writes on the direct server and refused them on
+         # the bridge: "send this to Mari" ran list_connections on the direct
+         # server, the agent preferred the bridge, and the bridge's
+         # list_connections came back "outside server request authority" --
+         # a request that named the integration lost access to it. Mirror the
+         # direct server's coverage for the operations the bridge actually
+         # implements, and no further: connection CRUD and call_method stay
+         # out of the family on both servers.
+         "mcp__oxs_whats2api_bridge__list_connections",
+         "mcp__oxs_whats2api_bridge__get_connection",
+         "mcp__oxs_whats2api_bridge__is_on_whatsapp",
+         "mcp__oxs_whats2api_bridge__send_message",
+         "mcp__oxs_whats2api_bridge__send_reaction",
+         "mcp__oxs_whats2api_bridge__mark_read",
+         "mcp__oxs_whats2api_bridge__send_presence",
+     }),
     # Read-only half of the messaging surface. A conversation *analyzer*
     # consumes chats and persists findings elsewhere; it never acts on the
     # account. Splitting the family lets such a task declare the capability
@@ -83,6 +100,9 @@ FAMILY_TOOLS = {
         "mcp__oxs_whats2api_bridge__get_message",
         "mcp__oxs_whats2api_bridge__list_events",
         "mcp__oxs_whats2api_bridge__list_connections_local",
+        "mcp__oxs_whats2api_bridge__list_connections",
+        "mcp__oxs_whats2api_bridge__get_connection",
+        "mcp__oxs_whats2api_bridge__is_on_whatsapp",
         "mcp__oxs_whats2api_bridge__health",
     }),
 }
