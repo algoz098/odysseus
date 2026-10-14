@@ -234,3 +234,47 @@ def test_foreground_policy_leaves_fallback_on_empty_false():
     from src.foreground_model_routing import ForegroundModelPolicy
 
     assert ForegroundModelPolicy().fallback_on_empty is False
+
+
+# --- The retry must not reproduce the same empty stream ---------------------
+#
+# Empty completions arrive in bursts and instant retries failed identically,
+# three in a row, before the turn was lost. A reused keepalive connection that
+# a peer half-closed is the classic source of "HTTP 200 with no body": every
+# standalone request from a fresh client succeeds while the long-lived pool
+# intermittently returns an empty stream. So the retry waits, and asks for a
+# connection of its own without disturbing the shared client.
+
+def test_the_retry_waits_before_reissuing():
+    import inspect
+
+    from src import llm_core
+
+    source = inspect.getsource(llm_core.stream_llm_with_fallback)
+    assert "await asyncio.sleep(backoff)" in source, (
+        "an instant retry lands in the same window and fails the same way"
+    )
+    assert len(llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS) >= 1
+    assert all(d > 0 for d in llm_core._EMPTY_COMPLETION_BACKOFF_SECONDS)
+
+
+def test_a_retry_gets_its_own_connection_once():
+    """The one-shot client is consumed by the next request, not sticky."""
+    import httpx
+
+    from src import llm_core
+
+    shared = llm_core._get_http_client()          # prime the process-wide client
+    llm_core._one_shot_client.set(True)
+    one_shot = llm_core._get_http_client()
+    after = llm_core._get_http_client()
+    assert isinstance(one_shot, httpx.AsyncClient)
+    assert one_shot is not shared, "the retry must not reuse the pooled client"
+    assert after is shared, "the one-shot must be consumed by the first request"
+
+
+def test_the_shared_client_is_untouched_by_a_retry():
+    from src import llm_core
+
+    assert llm_core._one_shot_client.get() is False
+    assert llm_core._get_http_client() is llm_core._get_http_client()

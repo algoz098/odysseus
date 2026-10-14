@@ -17,6 +17,7 @@ import os
 import math
 import ipaddress
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
 from src.model_context import get_context_length, DEFAULT_CONTEXT, is_local_endpoint
@@ -633,9 +634,30 @@ _http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=30, k
 # an empty completion streamed nothing, so re-issuing cannot duplicate tokens.
 _EMPTY_COMPLETION_RETRIES = 2
 
+# Backoff before re-issuing a candidate that returned an empty completion.
+# Instant retries landed inside the same rate-limit/pooled-connection window
+# and failed identically, three times in a row, before giving up.
+_EMPTY_COMPLETION_BACKOFF_SECONDS = (1.5, 4.0)
+
+# When set, the next provider request uses a one-shot client with its own
+# connection instead of the process-wide keepalive pool. A reused connection
+# that a peer half-closed is the classic source of "HTTP 200 with no body":
+# every standalone request from a fresh client succeeds, while the long-lived
+# pool intermittently returns an empty stream. One-shot only, so the shared
+# client (and everything else in flight on it) is never disturbed.
+_one_shot_client: ContextVar[bool] = ContextVar("llm_one_shot_client", default=False)
+
+
 def _get_http_client() -> httpx.AsyncClient:
     """Return process-wide AsyncClient. Per-request timeout is passed at call time."""
     global _http_client
+    if _one_shot_client.get():
+        from src.tls_overrides import llm_verify
+        # One-shot only: consume the request so a later call in the same turn
+        # goes back to the shared pool.
+        _one_shot_client.set(False)
+        return httpx.AsyncClient(
+            limits=_http_limits, http2=False, verify=llm_verify())
     if _http_client is None or _http_client.is_closed:
         from src.tls_overrides import llm_verify
         _http_client = httpx.AsyncClient(
@@ -4754,12 +4776,22 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
         if (retry_empty_completion and is_last
                 and empty_retries < _EMPTY_COMPLETION_RETRIES):
             empty_retries += 1
+            backoff = _EMPTY_COMPLETION_BACKOFF_SECONDS[
+                min(empty_retries, len(_EMPTY_COMPLETION_BACKOFF_SECONDS)) - 1
+            ]
             logger.warning(
                 "[fallback] %s %s returned no substantive output and has no "
-                "other candidate; retrying it (%s/%s)",
-                "primary" if i == 0 else "candidate", model,
+                "other candidate; retrying it on a fresh connection after %.1fs "
+                "(%s/%s)",
+                "primary" if i == 0 else "candidate", model, backoff,
                 empty_retries, _EMPTY_COMPLETION_RETRIES,
             )
+            await asyncio.sleep(backoff)
+            # A retry that reuses the same pooled connection reproduces the
+            # same empty stream. Ask for a one-shot client; the flag is
+            # consumed by the next _get_http_client() call, so the shared
+            # client and everything else in flight on it are untouched.
+            _one_shot_client.set(True)
             continue
         if not is_last and fallback_on_empty:
             last_error = f'event: error\ndata: {json.dumps({"error": f"Model {model} returned no substantive output", "status": 502})}\n\n'
