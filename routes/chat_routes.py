@@ -205,7 +205,7 @@ class _AgentRenderState:
             self.replaced_turn = True
             event["replacement_scope"] = "turn"
         elif event.get("delta") and not event.get("thinking"):
-            if self.owner == "structured":
+            if self.owner == "structured" and not event.get("server_disclosure"):
                 # final_response can be intermediate. A later model synthesis
                 # replaces it instead of being dropped or concatenated with it.
                 self.content = ""

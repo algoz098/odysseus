@@ -392,7 +392,13 @@ def with_completion_gate(func):
                 for event in answer_events:
                     yield _event(event)
                 if disclosure_only:
-                    yield _event({'delta': disclosure})
+                    # Tagged because this delta is the server's own fact, not
+                    # a new model answer. A client that replaces a streamed
+                    # draft on the next delta must not read it as the model
+                    # having replaced its own final_response -- doing so
+                    # discarded the answer and left the turn persisting only
+                    # this disclosure.
+                    yield _event({'delta': disclosure, 'server_disclosure': True})
             if provider_error:
                 yield _event({'type': 'completion_decision', 'data': decision.to_dict()})
             for event in metrics_events:
