@@ -27317,6 +27317,11 @@ async def stream_agent_loop(
             candidate_capability_recovery_factory=_candidate_capability_recovery,
             candidate_route_descriptors=_candidate_route_descriptors,
             retry_degenerate_stream_once=_terminal_completion_contract,
+            # A 200 with no text and no tool call is a provider blip, and it
+            # used to end the turn outright whenever the deployment had only
+            # one endpoint to offer. Re-issuing the final candidate is safe:
+            # an empty completion streamed nothing, so nothing can duplicate.
+            retry_empty_completion=True,
         ):
             if not _round_first_event_logged:
                 _round_first_event_logged = True

@@ -1,0 +1,161 @@
+"""An empty completion is a provider blip, not a verdict.
+
+A 200 response carrying no text and no tool call used to end the turn with
+"All model candidates returned no substantive output" (502). The only recovery
+was a *different* candidate, so a single-endpoint deployment had none and the
+whole request failed on a blip -- with the tool result already in hand and
+nothing to show for it.
+
+Retrying the same candidate is safe precisely because the completion was
+empty: no token reached the client, so re-issuing cannot duplicate output.
+"""
+import asyncio
+import json
+
+import pytest
+
+from src import llm_core
+
+DONE = "data: [DONE]\n\n"
+
+
+def _stream(*events):
+    """The app's own normalized SSE, which is what the fallback loop reads."""
+    return "".join(f"data: {json.dumps(e)}\n\n" for e in events) + DONE
+
+
+def _text(value):
+    return {"delta": value}
+
+
+def _tool_call(name="mcp__email__list_emails", args="{}"):
+    return {"type": "tool_calls", "calls": [
+        {"id": "call_1_0", "type": "function",
+         "function": {"name": name, "arguments": args}}]}
+
+
+def _error(status=502, message="All model candidates returned no substantive output"):
+    return f'event: error\ndata: {json.dumps({"error": message, "status": status})}\n\n'
+
+
+async def _run(monkeypatch, bodies, candidates=None, retry_empty=True):
+    """Replay each body as the candidate's stream, in call order."""
+    calls = []
+
+    async def fake_candidate(*args, **kwargs):
+        body = bodies[min(len(calls), len(bodies) - 1)]
+        calls.append(body)
+        for chunk in body.splitlines(keepends=True):
+            yield chunk
+
+    monkeypatch.setattr(llm_core, "_stream_candidate_with_context_recovery", fake_candidate)
+    cands = candidates or [("https://api.example/v1", "m", {"Authorization": "k"})]
+    out = []
+    async for chunk in llm_core.stream_llm_with_fallback(
+            cands, [{"role": "user", "content": "oi"}],
+            retry_empty_completion=retry_empty):
+        out.append(chunk)
+    return out, calls
+
+
+@pytest.mark.asyncio
+async def test_an_empty_completion_is_retried_on_the_same_candidate(monkeypatch):
+    out, calls = await _run(monkeypatch, [_stream(), _stream(_text("pronto"))])
+
+    assert len(calls) == 2, "an empty completion must be retried, not failed"
+    assert any('"delta"' in c for c in out), out
+    assert not any("no substantive output" in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_a_persistently_empty_completion_still_fails(monkeypatch):
+    out, calls = await _run(monkeypatch, [_stream()])
+
+    assert len(calls) == llm_core._EMPTY_COMPLETION_RETRIES + 1
+    assert any("no substantive output" in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_the_retry_is_bounded(monkeypatch):
+    _, calls = await _run(monkeypatch, [_stream()])
+
+    assert len(calls) <= llm_core._EMPTY_COMPLETION_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_a_successful_first_completion_is_not_retried(monkeypatch):
+    out, calls = await _run(monkeypatch, [_stream(_text("oi"))])
+
+    assert len(calls) == 1, "a completion with output must not be re-issued"
+    assert not any("no substantive output" in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_completion_is_substantive(monkeypatch):
+    out, calls = await _run(monkeypatch, [_stream(_tool_call())])
+
+    assert len(calls) == 1, "a tool call is output; it must not be re-issued"
+    assert any('"tool_calls"' in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_metadata_alone_does_not_commit_a_candidate(monkeypatch):
+    """A usage-only frame is not an answer and must not stop the retry."""
+    usage_only = {"type": "usage", "data": {"input_tokens": 10, "output_tokens": 0}}
+
+    out, calls = await _run(monkeypatch, [_stream(usage_only), _stream(_text("oi"))])
+
+    assert len(calls) == 2, "usage metadata is not substantive output"
+    assert any('"delta"' in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_without_the_opt_in_an_empty_completion_is_terminal(monkeypatch):
+    """The chain's contract is unchanged unless a caller opts in."""
+    out, calls = await _run(monkeypatch, [_stream()], retry_empty=False)
+
+    assert len(calls) == 1
+    assert any("no substantive output" in c for c in out), out
+
+
+@pytest.mark.asyncio
+async def test_the_empty_retry_still_falls_through_to_the_next_candidate(monkeypatch):
+    cands = [
+        ("https://primary.example/v1", "primary", {}),
+        ("https://backup.example/v1", "backup", {}),
+    ]
+    out, calls = await _run(
+        monkeypatch, [_stream(), _stream(), _stream(), _stream(_text("do backup"))],
+        candidates=cands, retry_empty=True,
+    )
+
+    assert any("do backup" in c for c in out), out
+    assert not any("All model candidates" in c for c in out), out
+
+
+def test_the_agent_loop_opts_into_the_empty_retry():
+    """The chat turn must survive a blip when there is no second endpoint."""
+    import inspect
+
+    import src.agent_loop as agent_loop
+
+    source = inspect.getsource(agent_loop)
+    assert "retry_empty_completion=True" in source, (
+        "stream_agent_loop must request the empty-completion retry; without it "
+        "a single-endpoint deployment has no recovery from a 200-with-no-output"
+    )
+
+
+def test_the_retry_is_opt_in_not_default():
+    """Other callers keep the terminal-on-empty contract unless they opt in."""
+    import inspect
+
+    from src import llm_core
+
+    # ``stream_llm_with_fallback`` pops the flag out of **kwargs, so the
+    # opt-in is visible in the source default rather than a named parameter.
+    source = inspect.getsource(llm_core.stream_llm_with_fallback)
+    assert 'kwargs.pop("retry_empty_completion", False)' in source, (
+        "the empty-completion retry must default to off so callers that did "
+        "not ask for it keep the terminal-on-empty contract"
+    )

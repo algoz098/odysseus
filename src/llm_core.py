@@ -626,6 +626,13 @@ def _clear_host_dead(url: str) -> None:
 _http_client: Optional[httpx.AsyncClient] = None
 _http_limits = httpx.Limits(max_connections=100, max_keepalive_connections=30, keepalive_expiry=30.0)
 
+# How many times one candidate may be re-issued after it returns an empty
+# completion (HTTP 200, no text, no tool call) before the turn is failed. Such
+# a response is a provider blip, and the only other recovery was a *different*
+# candidate -- so a single-endpoint deployment had none at all. Safe to retry:
+# an empty completion streamed nothing, so re-issuing cannot duplicate tokens.
+_EMPTY_COMPLETION_RETRIES = 2
+
 def _get_http_client() -> httpx.AsyncClient:
     """Return process-wide AsyncClient. Per-request timeout is passed at call time."""
     global _http_client
@@ -4486,6 +4493,10 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     retry_degenerate_stream_once = bool(
         kwargs.pop("retry_degenerate_stream_once", False)
     )
+    # Re-issue the final candidate when it returns an empty completion. Off by
+    # default: switching candidates is the chain's recovery mechanism, and this
+    # only matters when there is no second candidate to switch to.
+    retry_empty_completion = bool(kwargs.pop("retry_empty_completion", False))
     eligible_statuses = None if fallback_statuses is None else frozenset(fallback_statuses)
 
     raw_candidates = list(candidates or [])
@@ -4501,7 +4512,12 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     primary_route = route_descriptors[0]
     last_error = None
     failures = []
-    for i, (url, model, headers) in enumerate(cands):
+    # Indexed rather than a for-loop so an empty completion can re-run the
+    # *same* candidate instead of advancing to the next one.
+    i = 0
+    empty_retries = 0
+    while i < len(cands):
+        url, model, headers = cands[i]
         is_last = (i == len(cands) - 1)
         emitted = False
         retried = False
@@ -4544,6 +4560,7 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                         model,
                         status,
                     )
+                    i += 1
                     continue
                 yield error_chunk
                 return
@@ -4711,6 +4728,33 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
         if emitted:
             return
         if retried:
+            i += 1
+            empty_retries = 0
+            continue
+        # An empty completion is usually a provider hiccup rather than a
+        # verdict: MiniMax returns HTTP 200 with a stream carrying no text and
+        # no tool call, and the turn dies before any tool runs.
+        #
+        # Opt-in, and off by default. The fallback chain's contract is that an
+        # empty completion is terminal for a candidate and recovery means
+        # *switching* to another one; silently re-issuing a candidate would
+        # change that for every caller. What it does not cover is the
+        # single-endpoint deployment, where there is no other candidate to
+        # switch to and an empty completion is an immediate, unrecoverable
+        # turn failure. Callers that accept a repeated identical request turn
+        # this on explicitly.
+        #
+        # Safe to retry: `emitted` is false, so no token reached the client and
+        # re-issuing cannot duplicate output.
+        if (retry_empty_completion and is_last and fallback_on_empty
+                and empty_retries < _EMPTY_COMPLETION_RETRIES):
+            empty_retries += 1
+            logger.warning(
+                "[fallback] %s %s returned no substantive output and has no "
+                "other candidate; retrying it (%s/%s)",
+                "primary" if i == 0 else "candidate", model,
+                empty_retries, _EMPTY_COMPLETION_RETRIES,
+            )
             continue
         if not is_last and fallback_on_empty:
             last_error = f'event: error\ndata: {json.dumps({"error": f"Model {model} returned no substantive output", "status": 502})}\n\n'
@@ -4722,6 +4766,8 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
             })
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} returned no substantive output; trying next")
+            i += 1
+            empty_retries = 0
             continue
         if not is_last:
             yield f'event: error\ndata: {json.dumps({"error": f"Model {model} returned no substantive output", "status": 502})}\n\n'
