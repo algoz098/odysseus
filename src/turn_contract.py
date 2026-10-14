@@ -469,8 +469,26 @@ _EXPLICIT_INLINE_SHELL_COMMAND = re.compile(
     r"[^\n]{0,80}?(?::|`)\s*(?:printf|echo|pwd|whoami|uname|date|true|false|test)\b",
     re.I,
 )
+# A leading conjunction belongs to the sentence, not to the request. "e quais
+# emails eu tenho hoje?" is a lookup, but both lookup grammars are anchored, so
+# the "e" put them out of reach: the clause was then classified as an
+# explanatory question about the feature, ``_clause_capabilities`` returned
+# nothing at all, and a request that plainly named email came back "outside
+# the requested turn capabilities". Tolerating it here is scoped to the lookup
+# grammars, where it can only admit a question, unlike stripping it globally.
+# A leading conjunction belongs to the sentence, not to the request. "e quais
+# emails eu tenho hoje?" is a lookup, but both lookup grammars are anchored, so
+# the "e" put them out of reach: the clause was then classified as an
+# explanatory question about the feature, ``_clause_capabilities`` returned
+# nothing at all, and a request that plainly named email came back "outside the
+# requested turn capabilities". Tolerating it here is scoped to the lookup
+# grammars, where it can only admit a question, unlike stripping it from every
+# request globally.
+_PT_LEAD = r"^\s*(?:(?:e|que|eu)\s+)?"
+
 _LOOKUP = re.compile(
-    r"^\s*(?:(?:what(?:['’]?s|\s+is|\s+are)|which|where(?:['’]?s|\s+is|\s+are))"
+    _PT_LEAD +
+    r"(?:(?:what(?:['’]?s|\s+is|\s+are)|which|where(?:['’]?s|\s+is|\s+are))"
     r"\s+(?:my|our|the|today['’]?s)\b|what\s+(?:does|did)\s+(?:my|our|the|this|that)\b|"
     r"what\s+about\s+(?:(?:my|our|the)\s+)?\b|"
     r"(?:is|are)\s+there\s+(?:an?\s+)?(?:calendar\s+(?:thing|entry)|any\s+"
@@ -485,25 +503,33 @@ _LOOKUP = re.compile(
     r"(?:meus?\s+|minhas?\s+)?"
     r"(?:emails?|mensagens?|agenda|calend[aá]rio|compromissos?|reuni[õo]es?|eventos?|"
     r"tarefas?|pend[eê]ncias?|notas?|lembretes?)\b|"
-    r"(?:o\s+que\s+)?(?:eu\s+)?(?:tenho|ha|existe|possuo)\b[\s\S]{0,80}?"
+    # A bare noun phrase is a lookup too: "e os emails de hoje".
+    r"(?:os?\s+|as?\s+)(?:meus?\s+|minhas?\s+)?"
+    r"(?:emails?|mensagens?|agenda|calend[aá]rio|compromissos?|reuni[õo]es?|eventos?|"
+    r"tarefas?|pend[eê]ncias?|notas?|lembretes?)\b|"
+    r"(?:o\s+que\s+)?(?:eu\s+)?(?:tem|tenho|ha|existe|possuo)\b[\s\S]{0,80}?"
     r"\b(?:emails?|mensagens?|agenda|calend[aá]rio|compromissos?|reuni[õo]es?|eventos?|"
     r"tarefas?|pend[eê]ncias?|notas?|lembretes?)\b)",
     re.I,
 )
 _PERSONAL_STORE_LOOKUP = re.compile(
-    r"^\s*(?:please\s+)?look\s+(?:(?:in|at|through)\s+)?(?:(?:my|our|the)\s+)?"
+    _PT_LEAD +
+    r"(?:(?:please\s+)?look\s+(?:(?:in|at|through)\s+)?(?:(?:my|our|the)\s+)?"
     r"(?:emails?|mail|inbox|notes?|documents?|calendar|memories|tasks?)\b|"
-    r"^\s*(?:what|which|where|when|how\s+many)\b[\s\S]{0,180}?"
+    r"(?:what|which|where|when|how\s+many)\b[\s\S]{0,180}?"
     r"(?:\b(?:my|our)\b|\bdo\s+(?:i|we)\s+have\b|\b(?:is|are)\s+saved\b)|"
-    r"^\s*(?:does?|is|are)\s+any\s+"
+    r"(?:does?|is|are)\s+any\s+"
     r"(?:notes?|documents?|docs?|memories|tasks?|skills?|emails?|events?)\b"
     r"[\s\S]{0,180}\b(?:mention|contain|match|have|include)\b|"
     # The Portuguese equivalents of the two forms above.
-    r"^\s*(?:por\s+favor\s+)?(?:olh[ae]|procur[ae]|veja|mostre|liste|acesse|consulte)\s+"
+    r"(?:por\s+favor\s+)?(?:olh[ae]|procur[ae]|veja|mostre|liste|acesse|consulte)\s+"
     r"(?:minhas?\s+|meus?\s+|as?\s+|os?\s+)*"
     r"(?:emails?|mensagens?|agenda|calend[aá]rio|notas?|tarefas?|pend[eê]ncias?)\b|"
-    r"^\s*(?:quais?|quantos?)\b[\s\S]{0,180}?"
-    r"(?:\b(?:meus?|minhas?)\b|\b(?:eu\s+)?tenho\b|\b(?:foi\s+)?salv[oa]\b)",
+    r"(?:quais?|quantos?)\b[\s\S]{0,180}?"
+    r"(?:\b(?:meus?|minhas?)\b|\b(?:eu\s+)?tenho\b|\b(?:foi\s+)?salv[oa]\b)|"
+    # The same bare noun phrase, which has no verb to fall back on.
+    r"(?:os?\s+|as?\s+)(?:meus?\s+|minhas?\s+)?"
+    r"(?:emails?|mensagens?|agenda|calend[aá]rio|notas?|tarefas?|pend[eê]ncias?)\b)",
     re.I,
 )
 # Treat "schedule" as a calendar noun only when the wording makes that

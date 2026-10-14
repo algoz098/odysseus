@@ -4460,3 +4460,43 @@ def test_portuguese_vocabulary_does_not_reach_shell_or_web():
         caps = set(requested_capabilities(message))
         assert "shell_files" not in caps, message
         assert "search_browser" not in caps, message
+
+
+# --- The second turn of a chat must not inherit the first turn's tools ------
+#
+# Reported: "Envie uma mensagem no whatsapp para a mari" (sent, exit 0), then
+# "e quais emails eu tenho hoje?" came back "outside the requested turn
+# capabilities" with only the WhatsApp tools on offer. The message plainly
+# names email, and the family pattern matches it -- but the clause was
+# classified as an explanatory question about the feature, so
+# ``_clause_capabilities`` returned nothing and the whole turn got no
+# capability. The trigger was the leading conjunction: both lookup grammars
+# are anchored, and "e " put every Portuguese question out of their reach.
+
+@pytest.mark.parametrize(("message", "expected"), [
+    ("e quais emails eu tenho hoje?", "email"),
+    ("quais emails eu tenho hoje?", "email"),
+    ("e os emails de hoje", "email"),
+    ("quais compromissos tenho", "calendar"),
+    ("e o que tem na minha agenda", "calendar"),
+    ("o que tem na agenda", "calendar"),
+    ("quais notas eu salvei", "notes"),
+    ("as tarefas de hoje", "tasks"),
+])
+def test_a_portuguese_second_turn_reaches_its_own_family(message, expected):
+    assert expected in set(requested_capabilities(message, []))
+
+
+@pytest.mark.parametrize("message", [
+    "what are my emails",
+    "show me my notes",
+    "what is on my calendar",
+])
+def test_the_lead_tolerance_does_not_change_english_lookups(message):
+    assert requested_capabilities(message, [])
+
+
+def test_a_leading_conjunction_alone_still_grants_nothing():
+    """The tolerance only admits a question, never a bare conjunction."""
+    assert not requested_capabilities("tell me a joke", [])
+    assert not requested_capabilities("e me conte uma piada", [])
