@@ -3648,6 +3648,33 @@ def setup_chat_routes(
                 warm_tools=_warm_tools,
                 message=message, history=getattr(sess, "history", []) or [],
             )
+            if exact_tool_approval is not None:
+                # The operator just approved this tool, so the turn must be able
+                # to run it. Without this the approval is shown, accepted, and
+                # then the rebuilt contract refuses the very call it authorised:
+                # the route classifies the continuation from the original text
+                # again, reaches the same conclusion, and the operator's
+                # decision is discarded.
+                _approved_name = canonical_tool(exact_tool_approval.pending.tool_name)
+                _approved_schema = next(
+                    (json.dumps(s, sort_keys=True)
+                     for s in _contract_schemas
+                     if canonical_tool((s.get("function") or {}).get("name", "")) == _approved_name),
+                    None,
+                )
+                if _approved_schema and _approved_name not in _turn_contract.offered:
+                    from dataclasses import replace as _replace_contract
+                    _turn_contract = _replace_contract(
+                        _turn_contract,
+                        required=_turn_contract.required | {_approved_name},
+                        offered=_turn_contract.offered | {_approved_name},
+                        executable=_turn_contract.executable | {_approved_name},
+                        schema_json=(*_turn_contract.schema_json, _approved_schema),
+                    )
+                    logger.info(
+                        "[chat] turn contract extended with the approved tool %s",
+                        _approved_name,
+                    )
             _request_authority = _request_authority.restrict(_contract_policy)
             # Resolution already applies user, owner, and global policy. An
             # admitted tool must not later be rejected by the stale

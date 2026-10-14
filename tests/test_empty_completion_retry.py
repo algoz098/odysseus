@@ -271,6 +271,8 @@ def test_a_retry_gets_its_own_connection_once():
     assert isinstance(one_shot, httpx.AsyncClient)
     assert one_shot is not shared, "the retry must not reuse the pooled client"
     assert after is shared, "the one-shot must be consumed by the first request"
+    # Leave no state behind: the flag is process-wide and the next test reads it.
+    llm_core._one_shot_client.set(False)
 
 
 def test_the_shared_client_is_untouched_by_a_retry():

@@ -651,10 +651,14 @@ _one_shot_client: ContextVar[bool] = ContextVar("llm_one_shot_client", default=F
 def _get_http_client() -> httpx.AsyncClient:
     """Return process-wide AsyncClient. Per-request timeout is passed at call time."""
     global _http_client
-    if _one_shot_client.get() or os.getenv("ODYSSEUS_FORCE_FRESH_CONNECTION", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if _one_shot_client.get():
         from src.tls_overrides import llm_verify
-        if not _one_shot_client.get():
-            _one_shot_client.set(True)
+        # One-shot only: consume the request so a later call in the same turn
+        # goes back to the shared pool.
+        _one_shot_client.set(False)
+        return httpx.AsyncClient(limits=_http_limits, http2=False, verify=llm_verify())
+    if os.getenv("ODYSSEUS_FORCE_FRESH_CONNECTION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        from src.tls_overrides import llm_verify
         return httpx.AsyncClient(limits=_http_limits, http2=False, verify=llm_verify())
     if _one_shot_client.get():
         from src.tls_overrides import llm_verify

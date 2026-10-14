@@ -68,6 +68,7 @@ from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy, kn
 from src.client_tool_contract import TUI_CLIENT_TOOL_NAMES
 from src.tool_capabilities import (
     ResultIntegrity,
+    ToolGateDecision,
     ToolRunSecurityContext,
     blocked_tool_result,
     capabilities_for_action,
@@ -33531,12 +33532,27 @@ async def stream_agent_loop(
             blocked_by_disabled_tools = bool(
                 disabled_tools and not policy_names.isdisjoint(disabled_tools)
             )
+            # A turn contract is a *guess* about what this request is for,
+            # derived from its text. When the guess is wrong -- "e quais emails
+            # eu tenho hoje?" losing the leading conjunction, a family spelled
+            # only one way -- the tool was refused outright and the operator
+            # was never asked, so the agent read the refusal as "that
+            # integration is not configured" and went looking for a
+            # credential problem that did not exist. A denial the operator
+            # configured is still a denial; a tool the turn merely did not
+            # anticipate is a question for them, not a verdict.
+            blocked_by_turn_scope = bool(
+                turn_contract is not None
+                and not turn_contract.permits(block.tool_type)
+                and not blocked_by_tool_policy
+                and not (disabled_tools and block.tool_type in disabled_tools)
+            )
             _explicit_email_mutation_denied = _email_mutation_forbidden(
                 _last_user, block.tool_type
             )
             if turn_contract is not None:
                 blocked_by_tool_policy = (
-                    blocked_by_tool_policy or not turn_contract.permits(block.tool_type)
+                    blocked_by_tool_policy or blocked_by_turn_scope
                 )
                 blocked_by_disabled_tools = (
                     blocked_by_disabled_tools or blocked_by_tool_policy
@@ -33549,6 +33565,28 @@ async def stream_agent_loop(
                 client_runtime_context=client_runtime_context,
                 workspace=workspace,
             )
+            if (
+                blocked_by_turn_scope
+                and not broad_host_read_reason
+                and not _explicit_email_mutation_denied
+            ):
+                # Not a denial: this turn simply did not anticipate the tool.
+                # Clear the policy flags and force a not-allowed decision so
+                # the operator gets the approval card. Refusing here is what
+                # made the agent report a working integration as unconfigured.
+                blocked_by_tool_policy = False
+                blocked_by_disabled_tools = False
+                security_decision = ToolGateDecision(
+                    False,
+                    reason=(
+                        "This turn did not include the tool the request "
+                        "implies. The operator must allow it."
+                    ),
+                )
+                logger.info(
+                    "[agent] %s is outside this turn's contract; asking the "
+                    "operator instead of refusing", block.tool_type,
+                )
             requested_host_command = full_command
             bounded_host_read = (
                 _tui_bounded_host_read_command(full_command)
