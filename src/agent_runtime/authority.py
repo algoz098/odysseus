@@ -373,6 +373,27 @@ class SemanticIntent:
     required_read: RequiredReadOperation | None
 
 
+def _row_field(row, key, default=None):
+    return row.get(key, default) if isinstance(row, dict) else getattr(row, key, default)
+
+
+def _row_metadata(row):
+    metadata = _row_field(row, "metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _row_is_trusted_user(row):
+    """An end-user request, as opposed to an agent-authored or gated one."""
+    metadata = _row_metadata(row)
+    return (metadata.get("trusted") is not False
+            and not metadata.get("tool_gate_untrusted"))
+
+
 def interpret_request(request_text, *, history=(), workspace=None, active_document=False,
                       image_attachment=False):
     if not isinstance(request_text, str):
@@ -382,17 +403,48 @@ def interpret_request(request_text, *, history=(), workspace=None, active_docume
     # cannot establish a new authorized operation class.
     history = tuple(history or ())
     trusted_history = []
-    for row in history:
-        get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
-        metadata = get("metadata") or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except ValueError:
-                metadata = {}
-        if (get("role") == "user" and isinstance(metadata, dict)
-                and metadata.get("trusted") is not False and not metadata.get("tool_gate_untrusted")):
-            trusted_history.append({"role": "user", "content": get("content", "")})
+    # An untrusted request breaks the continuity chain. Nothing established
+    # before it — neither the user's own wording nor an execution receipt —
+    # may authorize the request in front of us. The cutoff has to be known
+    # before the rows are read, because the receipt it invalidates sits
+    # earlier in the history than the request that invalidates it.
+    cutoff = max(
+        (index for index, row in enumerate(history)
+         if _row_field(row, "role") == "user"
+         and not _row_is_trusted_user(row)),
+        default=-1,
+    )
+    for index, row in enumerate(history):
+        role = _row_field(row, "role")
+        metadata = _row_metadata(row)
+        if role == "user":
+            if _row_is_trusted_user(row):
+                trusted_history.append({"role": "user", "content": _row_field(row, "content", "")})
+            continue
+        if role != "assistant" or index <= cutoff:
+            continue
+        # Execution receipts, not model prose. ``tool_events`` is a
+        # server-owned metadata key — it is stripped from every
+        # caller-supplied blob — and only successful receipts are forwarded,
+        # so an elliptical follow-up ("agora salva isso") can inherit the
+        # domain the previous turn actually proved. Filtering to user rows
+        # alone left ``requested_capabilities`` with no evidence at all and
+        # silently disabled every referential inheritance it implements.
+        # The prose is dropped: a model's own words must never establish a
+        # capability the request did not ask for.
+        receipts = [
+            event
+            for event in ((metadata or {}).get("tool_events") or [])
+            if isinstance(event, dict)
+            and event.get("error") is not True
+            and event.get("exit_code") in (None, 0)
+        ]
+        if receipts:
+            trusted_history.append({
+                "role": "assistant",
+                "content": "",
+                "metadata": {"tool_events": receipts},
+            })
     families = requested_capabilities(request_text, trusted_history,
         active_document=active_document, workspace=bool(workspace), image_attachment=image_attachment)
     selected = selected_tools_for_request(request_text)

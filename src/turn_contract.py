@@ -4241,6 +4241,29 @@ def _families_for_tool(tool: str) -> frozenset[str]:
     return frozenset(family for family, tools in FAMILY_TOOLS.items() if bare in tools)
 
 
+def _dedicated_family_for_tool(tool: str) -> str | None:
+    """The one product domain a tool belongs to, or ``None`` if it names none.
+
+    ``_families_for_tool`` answers "every family that lists this tool", which
+    is right when a caller unions over several tools. It is the wrong answer
+    for a caller that must name *the* domain a turn established, because a
+    read-only capability is deliberately listed inside its full capability:
+    every bridge read resolves to ``{messaging, messaging_read}`` at once. A
+    caller guarding on ``len(families) == 1`` then refuses to recognize any
+    of them, and an elliptical follow-up ("agora salva isso") inherits no
+    capability at all — every later tool call comes back
+    ``request_authority_denied``. Collapsing the declared read-only halves
+    restores the single domain without inventing one: two genuinely distinct
+    domains (a web read plus a notes write) still resolve to two and are
+    still refused.
+    """
+    families = _families_for_tool(tool)
+    if not families:
+        return None
+    full = families - READ_ONLY_FAMILIES
+    return sorted(full or families)[0]
+
+
 def _clause_capabilities(text: str) -> set[str]:
     # A prohibition constrains authority; it must never grant the family named
     # only as the forbidden side effect (for example, "do not create a file").
@@ -4557,7 +4580,7 @@ def recently_executed_families(history: Iterable, *, user_turns: int = 6,
                         "skills": "skills", "memory": "memory", "memories": "memory",
                         "brain": "memory", "cookbook": "cookbook_admin",
                     }.get(panel)
-            family = family or next(iter(_families_for_tool(tool)), None)
+            family = family or _dedicated_family_for_tool(tool)
             if family and family not in found:
                 found.append(family)
                 if len(found) >= maximum:
@@ -4635,7 +4658,11 @@ def immediately_established_family(message: str, history: Iterable) -> str | Non
         for event in (metadata or {}).get("tool_events") or ():
             if event.get("error") is True or event.get("exit_code") not in (None, 0):
                 continue
-            families.update(_families_for_tool(canonical_tool(event.get("tool", ""))))
+            # One domain per tool, so a capability that declares a read-only
+            # half still counts as the single domain its turn established.
+            family = _dedicated_family_for_tool(canonical_tool(event.get("tool", "")))
+            if family:
+                families.add(family)
         break
     if assistant_index is None or len(families) != 1:
         return None

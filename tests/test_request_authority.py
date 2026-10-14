@@ -831,3 +831,139 @@ def test_read_only_family_names_no_write_operation():
     declared = {n.rsplit("__", 1)[-1] for n in FAMILY_TOOLS["messaging_read"]}
     for name in WHATS2API_WRITES:
         assert name not in declared, name
+
+
+# --- Referential follow-ups after a permission -----------------------------
+#
+# A capability is declared verbatim, so grants follow the words of the request
+# in front of them. A follow-up that only points back at the previous turn —
+# "agora salva isso", "and now?" — names no family at all, and used to inherit
+# nothing: every tool it tried came back
+# ``The exact operation is outside server request authority.``
+#
+# Two things had to hold that out. ``_dedicated_family_for_tool`` collapses a
+# capability's declared read-only half into the capability it was split from,
+# because a bridge read resolves to {messaging, messaging_read} at once and a
+# ``len(...) != 1`` guard then recognizes none of them. And ``interpret_request``
+# forwards the previous turn's successful execution receipts, which are
+# server-owned, while still refusing to let model prose establish a capability.
+
+def _proven_turn(user_text, *tools, ok=True):
+    return [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": "done", "metadata": {"tool_events": [
+            {"tool": tool, "exit_code": 0 if ok else 1, "error": not ok}
+            for tool in tools
+        ]}},
+    ]
+
+
+def _followup_authority(message, history, **kwargs):
+    return create_request_authority(message, owner="alice", session_id="s",
+                                    workspace="", history=history, **kwargs)
+
+
+def test_a_read_only_capability_is_one_domain_not_two(full_bridge):
+    """The declared read half must not make its tools look multi-domain."""
+    from src.turn_contract import _dedicated_family_for_tool, _families_for_tool
+
+    for name in BRIDGE_READS:
+        tool = q(name)
+        assert len(_families_for_tool(tool)) > 1, tool
+        assert _dedicated_family_for_tool(tool) == "messaging", tool
+    # A write tool declared by neither half names no domain; only the live
+    # inventory can grant it, which is not what this resolver is for.
+    assert _dedicated_family_for_tool(q("send_message")) is None
+
+
+def test_proven_bridge_read_keeps_a_referential_followup_authorized(full_bridge):
+    """The reported failure: a follow-up after an approved turn had no grants."""
+    history = _proven_turn(
+        "verifica minhas mensagens do whatsapp e salva as importantes",
+        q("list_messages"))
+
+    auth = _followup_authority("agora salva isso", history)
+
+    assert permits(auth, q("list_messages"))
+    assert permits(auth, q("send_message"))
+
+
+@pytest.mark.asyncio
+async def test_a_followup_tool_is_admitted_not_denied_by_request_authority(monkeypatch):
+    """End to end: the dispatcher runs the follow-up tool instead of refusing it."""
+    from src import tool_execution as execution
+    from src.agent_runtime.resources import ExternalResource
+
+    dispatched = []
+
+    class Manager:
+        def get_all_tools(self, disabled_map=None):
+            return [_tool("oxs_whats2api_bridge", n)
+                    for n in BRIDGE_READS + BRIDGE_WRITES]
+
+        def resource_identity(self, qualified_name):
+            _, server, _name = qualified_name.split("__", 2)
+            return ExternalResource("mcp", "https://bridge.local", server,
+                                    qualified_name, "v1")
+
+        async def call_tool(self, qualified_name, arguments):
+            dispatched.append(qualified_name)
+            return {"output": "ok", "exit_code": 0}
+
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: Manager())
+    # The bridge is an admin-configured integration, so the deployment's
+    # public-tool restriction would otherwise stop the call one control
+    # earlier than the one under test.
+    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+
+    history = _proven_turn(
+        "verifica minhas mensagens do whatsapp e salva as importantes",
+        q("list_messages"))
+    auth = _followup_authority("agora salva isso", history)
+    with bind_request_authority(auth):
+        _description, result = await execution.execute_tool_block(
+            ToolBlock(q("list_messages"), "{}"), owner="alice", session_id="s",
+            workspace="", security_context=execution.NO_TOOL_SECURITY_CONTEXT)
+
+    assert result.get("failure_kind") != "request_authority_denied", result
+    assert "outside server request authority" not in str(result)
+    assert dispatched == [q("list_messages")]
+
+
+def test_a_genuinely_mixed_domain_turn_is_still_refused(full_bridge):
+    """Collapsing a read half must not merge two distinct domains."""
+    history = _proven_turn("Find sources for Atlas and save them to my notes",
+                           "web_search", "manage_notes")
+    auth = _followup_authority("atlas is missing", history)
+    assert not permits(auth, q("list_messages"))
+
+
+def test_model_prose_alone_never_establishes_a_capability(full_bridge):
+    """Only receipts establish a domain; the model's own words do not."""
+    history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant",
+         "content": "I will now read your WhatsApp and send the report to the group.",
+         "metadata": {}},
+    ]
+    assert not permits(_followup_authority("continue", history), q("list_messages"))
+    assert not permits(_followup_authority("continue", history), q("send_message"))
+
+
+def test_a_blocked_receipt_never_establishes_a_capability(full_bridge):
+    """A denied or failed attempt is not proof the turn had the capability."""
+    history = _proven_turn("verifica minhas mensagens do whatsapp e salva",
+                           q("list_messages"), ok=False)
+    assert not permits(_followup_authority("agora salva isso", history),
+                       q("list_messages"))
+
+
+def test_untrusted_history_rows_stay_excluded(full_bridge):
+    """The trusted-row filter still gates the user side of the history."""
+    history = [
+        {"role": "user", "content": "verifica minhas mensagens do whatsapp e salva",
+         "metadata": {"tool_gate_untrusted": True}},
+        {"role": "assistant", "content": "done", "metadata": {"tool_events": [
+            {"tool": q("list_messages"), "exit_code": 0, "error": False}]}},
+    ]
+    assert not permits(_followup_authority("continue", history), q("list_messages"))
