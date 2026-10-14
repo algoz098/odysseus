@@ -12,6 +12,7 @@ from dataclasses import replace
 from functools import wraps
 from inspect import signature
 import json
+import logging
 import re
 from time import perf_counter
 
@@ -22,6 +23,8 @@ from src.agent_evidence import (
 )
 from .effect_log import EffectLog
 from .journal import ActionJournal, bind_journal, current_journal
+
+logger = logging.getLogger(__name__)
 
 
 def _ledger(journal: ActionJournal, requirements) -> EvidenceLedger:
@@ -369,6 +372,13 @@ def with_completion_gate(func):
                                                         or filtered_answer != answer)
             replaced_answer = not disclosure_only and bool(
                 presentation_replaced or reason or unsafe_draft or safe_answer != answer)
+            logger.info(
+                "[completion-gate] answer=%s filtered=%s safe=%s disclosure=%s "
+                "events=%d disclosure_only=%s replaced=%s reason=%r",
+                len(answer or ""), len(filtered_answer or ""), len(safe_answer or ""),
+                len(disclosure or ""), len(answer_events), disclosure_only,
+                replaced_answer, reason,
+            )
             if replaced_answer:
                 reasoning = [event for event in answer_events if event.get('thinking') is True]
                 _, unsafe_reasoning = completion_answer(
