@@ -30353,6 +30353,13 @@ async def stream_agent_loop(
                 for schema in normalized_external_tool_schemas
             },
         ).strip()
+        logger.info(
+            "[agent-round-text] round=%s round_response=%s round_reasoning=%s "
+            "cleaned_round=%s full_response=%s used_native=%s tool_blocks=%d",
+            round_num, len(round_response or ""), len(round_reasoning or ""),
+            len(cleaned_round or ""), len(full_response or ""),
+            bool(used_native), len(tool_blocks),
+        )
         if _ody_qwen_finetune_model or _qwen38_tool_router:
             cleaned_round = _visible_response_text(cleaned_round)
             cleaned_round = _normalize_ody_qwen_text_artifacts(cleaned_round)
