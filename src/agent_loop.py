@@ -16052,6 +16052,42 @@ def _normalize_csv_write_body_from_resolved_tool_evidence(
     return output.getvalue().rstrip("\n")
 
 
+def answer_calls_dropped_by_approval(
+    tool_result_texts: list,
+    tool_results: list,
+    converted_calls: list,
+) -> int:
+    """Answer the calls an approval card stopped from running.
+
+    The batch loop breaks at a pending approval on purpose: the user has to
+    decide before anything else in that batch runs. Breaking is correct.
+    Breaking *silently* is not. The assistant message still declares every
+    call in the batch, so a call that never ran is answered with an empty tool
+    result -- the model reads that as "done", never re-issues the call, and
+    the rest of the request quietly never happens. "Check my email" plus
+    "check my calendar" losing the calendar read is what an operator sees as
+    the tool working half the time.
+
+    Returns how many calls were answered this way.
+    """
+    notice = (
+        "Not executed: this turn paused for a user approval decision on an "
+        "earlier action in the same batch. This is not a result. Once the user "
+        "answers, call it again if it is still part of the request."
+    )
+    added = 0
+    # The two lists are distinct at the call site; guard the aliased case so a
+    # caller passing one list twice cannot make this loop double-fill.
+    targets = [tool_result_texts]
+    if tool_results is not tool_result_texts:
+        targets.append(tool_results)
+    while len(tool_result_texts) < len(converted_calls):
+        for target in targets:
+            target.append(notice)
+        added += 1
+    return added
+
+
 def _append_tool_results(
     messages: List[Dict],
     round_response: str,
@@ -36294,6 +36330,23 @@ async def stream_agent_loop(
             if _pending_ask_user_event:
                 # An approval card is a turn boundary.  Never execute a later
                 # model-supplied call from the same batch after this request.
+                #
+                # Not executing them is the point; dropping them *silently* is
+                # the bug. The assistant message below still declares every
+                # call in the batch, so a discarded one is answered with an
+                # empty tool result: the model is told nothing happened, never
+                # re-issues the call, and the rest of the request silently
+                # never runs. A batch of "check email" + "check calendar"
+                # losing the calendar read is what the operator sees as the
+                # tool working "half the time". Answer every remaining call
+                # explicitly so the next round can pick the work back up.
+                _discarded = tool_blocks[i + 1:]
+                for _dropped in _discarded:
+                    logger.info(
+                        "[agent] not executing %s from this batch: the turn "
+                        "paused for an approval decision",
+                        _dropped.tool_type,
+                    )
                 break
 
         if _tui_bash_block_completed:
@@ -36685,6 +36738,17 @@ async def stream_agent_loop(
         # tool_blocks but stayed in native_tool_calls, so indexing results by
         # native position mis-attached each result to the wrong tool_call_id
         # (and left the real call answered empty).
+        #
+        # A batch that paused for an approval is the same failure by another
+        # route: the calls after the approval card never ran, so the tail of
+        # tool_result_texts is short and _append_tool_results would answer them
+        # with empty content -- the model sees the work as done, or as an empty
+        # read, and never repeats it. Answer each one with what actually
+        # happened so the next round resumes the rest of the request.
+        if _pending_ask_user_event:
+            answer_calls_dropped_by_approval(
+                tool_result_texts, tool_results, converted_calls,
+            )
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning,
