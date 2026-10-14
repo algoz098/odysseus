@@ -16,6 +16,7 @@ _DEFAULT_FALLBACK_ENTRY_RESOLVER = resolve_fallback_entries
 
 FOREGROUND_FALLBACK_ENABLED_KEY = "foreground_fallback_enabled"
 FOREGROUND_FALLBACK_LIST_KEY = "foreground_model_fallbacks"
+FOREGROUND_FALLBACK_ON_EMPTY_KEY = "foreground_fallback_on_empty"
 FOREGROUND_AVAILABILITY_STATUSES: FrozenSet[int] = frozenset({
     408, 425, 429, 500, 502, 503, 504, 507, 508, 529,
 })
@@ -30,6 +31,12 @@ class ForegroundModelPolicy:
     fallback_candidates: Tuple[tuple, ...] = ()
     fallback_descriptors: Tuple[dict, ...] = ()
     eligible_statuses: FrozenSet[int] = FOREGROUND_AVAILABILITY_STATUSES
+    # Whether an empty completion may move to the next candidate. Off unless
+    # the owner turns it on: some providers answer HTTP 200 with no body, and
+    # one owner would rather see that surfaced than have the answer come from
+    # a different model, while another would rather have the answer. It is a
+    # per-owner choice, not a default, and a configured fallback does not imply
+    # it. The same-candidate retry applies either way.
     fallback_on_empty: bool = False
 
 
@@ -143,6 +150,7 @@ def resolve_foreground_model_policy(
         fallback_descriptors=tuple(
             dict(descriptor) for _candidate, descriptor in resolved_routes
         ),
+        fallback_on_empty=prefs.get(FOREGROUND_FALLBACK_ON_EMPTY_KEY) is True,
     )
 
 

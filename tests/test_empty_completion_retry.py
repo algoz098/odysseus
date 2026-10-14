@@ -278,3 +278,57 @@ def test_the_shared_client_is_untouched_by_a_retry():
 
     assert llm_core._one_shot_client.get() is False
     assert llm_core._get_http_client() is llm_core._get_http_client()
+
+
+# --- A configured fallback must be usable on an empty completion -----------
+#
+# MiniMax intermittently answers HTTP 200 with no body. A same-candidate
+# retry covers one blip; three in a row ended the turn outright because the
+# foreground policy refused to move to another candidate on empty. Configuring
+# a fallback and then not using it on the failure that motivated it is not a
+# configuration. It is opt-in: with no fallback configured there is nothing to
+# move to, so the flag stays false and the retry remains the whole recovery.
+
+def test_no_configured_fallback_keeps_empty_completion_strict():
+    from src.foreground_model_routing import ForegroundModelPolicy
+
+    assert ForegroundModelPolicy().fallback_on_empty is False
+
+
+def test_empty_completion_fallback_is_opt_in_per_owner(monkeypatch):
+    """A configured fallback does not by itself authorise switching on empty.
+
+    Some providers answer HTTP 200 with no body. Whether the answer should then
+    come from a different model is the owner's call, so it is a preference and
+    not implied by configuring a fallback.
+    """
+    from src.foreground_model_routing import (
+        FOREGROUND_FALLBACK_ON_EMPTY_KEY, resolve_foreground_model_policy,
+    )
+
+    entries = [{"endpoint_id": "e1", "model": "backup"}]
+    candidates = [("https://backup.example/v1", "backup", {})]
+
+    def fake(entries_, owner=None, require_exact_model=False):
+        return candidates
+
+    monkeypatch.setattr(
+        "src.foreground_model_routing.resolve_fallback_entries", fake)
+    monkeypatch.setattr(
+        "src.foreground_model_routing._load_policy_preferences",
+        lambda owner: {
+            "foreground_fallback_enabled": True,
+            "foreground_model_fallbacks": entries,
+        })
+
+    assert resolve_foreground_model_policy("alice").fallback_on_empty is False
+
+    monkeypatch.setattr(
+        "src.foreground_model_routing._load_policy_preferences",
+        lambda owner: {
+            "foreground_fallback_enabled": True,
+            "foreground_model_fallbacks": entries,
+            FOREGROUND_FALLBACK_ON_EMPTY_KEY: True,
+        })
+
+    assert resolve_foreground_model_policy("alice").fallback_on_empty is True
