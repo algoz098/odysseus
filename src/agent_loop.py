@@ -38380,13 +38380,30 @@ async def stream_agent_loop(
         and full_response.strip() not in (_response_before_tool_summary or "")
     ):
         _final_delta = full_response.strip()
+        logger.info(
+            "[agent-final] emitting final_response chars=%d round_texts=%s "
+            "response_before_len=%d",
+            len(_final_delta), [len(t or "") for t in round_texts],
+            len(_response_before_tool_summary or ""),
+        )
         yield f"data: {json.dumps({'type': 'final_response', 'content': _final_delta})}\n\n"
-    elif (
+        _final_response_emitted = True
+    else:
+        _final_response_emitted = False
+    if (
         (_ody_qwen_finetune_model or _qwen38_tool_router)
         and _web_search_completed
         and full_response.strip()
+        and not _final_response_emitted
     ):
         yield f"data: {json.dumps({'type': 'final_response', 'content': full_response.strip()})}\n\n"
+
+    logger.info(
+        "[agent-final] emitted=%s full_response=%d response_before_len=%d round_texts=%s",
+        _final_response_emitted, len(full_response or ""),
+        len(_response_before_tool_summary or ""),
+        [len(t or "") for t in round_texts],
+    )
 
     if (_compact_memory_list_turn or _compact_document_list_turn) and full_response.strip():
         # Let clients replace any accumulated partial response with the
