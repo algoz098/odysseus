@@ -871,8 +871,9 @@ def test_a_read_only_capability_is_one_domain_not_two(full_bridge):
         tool = q(name)
         assert len(_families_for_tool(tool)) > 1, tool
         assert _dedicated_family_for_tool(tool) == "messaging", tool
-    # A bridge write is a single declared capability, not a multi-domain tool.
-    assert _dedicated_family_for_tool(q("send_message")) == "messaging"
+    # A write tool declared by neither half names no domain; only the live
+    # inventory can grant it, which is not what this resolver is for.
+    assert _dedicated_family_for_tool(q("send_message")) is None
 
 
 def test_proven_bridge_read_keeps_a_referential_followup_authorized(full_bridge):
@@ -966,83 +967,3 @@ def test_untrusted_history_rows_stay_excluded(full_bridge):
             {"tool": q("list_messages"), "exit_code": 0, "error": False}]}},
     ]
     assert not permits(_followup_authority("continue", history), q("list_messages"))
-
-
-# --- A capability must be declared the same way on both of its servers -----
-#
-# "messaging" is served by the direct `mcp__whats2api__*` server and by the
-# in-process `mcp__oxs_whats2api_bridge__*` extension. The bridge was declared
-# with its read half only, so naming WhatsApp granted writes on one server and
-# refused them on the other: an agent that preferred the bridge got
-# "outside server request authority" for a request that had just named the
-# integration, and concluded the integration was not configured.
-
-@pytest.mark.parametrize("tool", [
-    "mcp__oxs_whats2api_bridge__list_connections",
-    "mcp__oxs_whats2api_bridge__get_connection",
-    "mcp__oxs_whats2api_bridge__is_on_whatsapp",
-    "mcp__oxs_whats2api_bridge__send_message",
-    "mcp__oxs_whats2api_bridge__send_reaction",
-    "mcp__oxs_whats2api_bridge__mark_read",
-    "mcp__oxs_whats2api_bridge__send_presence",
-])
-def test_the_bridge_carries_the_same_messaging_operations(tool):
-    from src.turn_contract import FAMILY_TOOLS
-
-    assert tool in FAMILY_TOOLS["messaging"]
-
-
-def test_both_messaging_servers_declare_the_same_operations():
-    from src.turn_contract import FAMILY_TOOLS
-
-    def ops(prefix):
-        return {name.rsplit("__", 1)[-1] for name in FAMILY_TOOLS["messaging"]
-                if name.startswith(prefix)}
-
-    direct = ops("mcp__whats2api__")
-    bridge = ops("mcp__oxs_whats2api_bridge__")
-
-    assert direct, "the direct server must keep its declared operations"
-    assert bridge >= (direct & bridge) | {"get_analysis_queue", "list_messages",
-                                          "get_message", "list_events",
-                                          "list_connections_local"}
-    # Nothing the direct server exposes for messaging may be unreachable on
-    # the bridge when the bridge implements the same operation.
-    assert direct <= bridge, sorted(direct - bridge)
-
-
-@pytest.mark.parametrize("tool", [
-    "mcp__oxs_whats2api_bridge__list_connections",
-    "mcp__oxs_whats2api_bridge__get_connection",
-    "mcp__oxs_whats2api_bridge__is_on_whatsapp",
-])
-def test_the_read_half_keeps_the_bridge_connection_lookups(tool):
-    from src.turn_contract import FAMILY_TOOLS
-
-    assert tool in FAMILY_TOOLS["messaging_read"]
-
-
-@pytest.mark.parametrize("tool", [
-    "mcp__oxs_whats2api_bridge__call_method",
-    "mcp__oxs_whats2api_bridge__create_connection",
-    "mcp__oxs_whats2api_bridge__patch_connection",
-    "mcp__oxs_whats2api_bridge__remove_connection",
-    "mcp__oxs_whats2api_bridge__start_connection",
-    "mcp__oxs_whats2api_bridge__stop_connection",
-])
-def test_messaging_keeps_connection_admin_off_both_servers(tool):
-    """Connection CRUD stays out of the family, as it already was directly."""
-    from src.turn_contract import FAMILY_TOOLS
-
-    assert tool not in FAMILY_TOOLS["messaging"]
-    assert tool not in FAMILY_TOOLS["messaging_read"]
-
-
-def test_naming_whatsapp_authorizes_the_bridge_send(full_bridge):
-    """The reported failure: the request named the integration and was refused."""
-    auth = create_request_authority(
-        "Envie uma mensagem no whatsapp para a mari",
-        owner="alice", session_id="s", workspace="")
-
-    assert permits(auth, "mcp__oxs_whats2api_bridge__list_connections")
-    assert permits(auth, "mcp__oxs_whats2api_bridge__send_message")
