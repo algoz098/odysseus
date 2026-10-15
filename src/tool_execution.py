@@ -1688,9 +1688,17 @@ async def execute_tool_block(
             reason = f"Execution of tool '{getattr(block, 'tool_type', '')}' is forbade by the active tool policy."
         elif isinstance(authority, RequestAuthority) and authority.restricted(operation):
             reason = "The exact operation is disabled by user or server request authority policy."
+        # ``requires_authority_approval`` lets the dispatch loop replace the
+        # silent BLOCKED return with the same approval card the untrusted-
+        # context gate already uses, so a tool that the request authority
+        # silently drops turns into a question for the operator instead of a
+        # verdict. Other callers (skills tester, scheduled task runner, audit
+        # tooling) ignore the flag and still see the BLOCKED result.
         return f"{getattr(block, 'tool_type', '')}: BLOCKED", {
             "error": reason,
             "exit_code": 1, "blocked": True, "failure_kind": "request_authority_denied",
+            "requires_authority_approval": True,
+            "authority_reason": reason,
         }
 
     from src.turn_contract import active_turn_contract
