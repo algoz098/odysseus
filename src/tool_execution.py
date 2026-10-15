@@ -1676,11 +1676,28 @@ async def execute_tool_block(
                 tool_name=getattr(block, "tool_type", None), content=getattr(block, "content", None)))
         admitted = valid and (authority.permits(operation) or exact_admission)
     except (ValueError, TypeError) as error:
+        # Malformed tool arguments cannot be retried by the model verbatim;
+        # the same payload will fail again. Carry the same approval-card
+        # bridge the ``requires_authority_approval`` path uses, so a model
+        # whose first attempt hit a JSON encoding error surfaces an approval
+        # card instead of silently stopping every later call to the same
+        # tool. The operator can allow a one-off dispatch and the model
+        # can move past the false negative.
+        bad_args_reason = (
+            f"Tool arguments are not valid JSON: {error}"
+            if isinstance(error, json.JSONDecodeError)
+            else str(error)
+        )
         return f"{getattr(block, 'tool_type', '')}: invalid arguments", {
-            "error": (f"Tool arguments are not valid JSON: {error}"
-                      if isinstance(error, json.JSONDecodeError) else str(error)),
+            "error": bad_args_reason,
             "exit_code": 1, "blocked": True,
             "failure_kind": "request_authority_denied",
+            "requires_authority_approval": True,
+            "authority_reason": (
+                f"{bad_args_reason} The model cannot recover without an "
+                "explicit allow — please approve so the operator can "
+                "diagnose the bad payload and decide."
+            ),
         }
     if not admitted:
         reason = "The exact operation is outside server request authority."
@@ -1704,9 +1721,24 @@ async def execute_tool_block(
     from src.turn_contract import active_turn_contract
     contract = active_turn_contract()
     if contract is not None and not contract.permits(getattr(block, "tool_type", "")):
+        # A turn contract denial at this layer happens for callers that
+        # bypass the agent-loop gate (skill tests, scheduled task runners,
+        # audit tooling). Mirror the untrusted-context approval path the
+        # dispatch loop already uses, otherwise the same "tools work, then
+        # the next one silently fails" surface reappears for every caller
+        # outside ``stream_agent_loop``. The agent-loop branch in
+        # ``stream_agent_loop`` already replaces this with an approval card
+        # before the tool ever reaches ``execute_tool_block``, so the
+        # ``requires_authority_approval`` flag is a no-op there.
         return f"{getattr(block, 'tool_type', '')}: BLOCKED", {
             "error": "Tool is outside the requested turn capabilities.",
             "exit_code": 1, "failure_kind": "turn_contract_denied",
+            "requires_authority_approval": True,
+            "authority_reason": (
+                "This turn did not include the tool the request implies. "
+                "Approve once to dispatch it; the same allow makes the "
+                "continuation recognise the tool."
+            ),
         }
 
     transport = operation.transport_tool
@@ -2563,6 +2595,39 @@ def format_tool_result(description: str, result: Dict) -> str:
             parts.append(f'Document edited: "{result.get("title", "")}" (v{result.get("version", "?")}, {result.get("applied", 0)} edit(s) applied)')
     elif "error" in result:
         parts.append(f"**Error:** {result['error']}")
+
+    # The failure kind is the only signal a model has to distinguish a
+    # blocked-by-policy tool from a backend that returned an error. Without
+    # it the model lumps both into "the server is denying write operations"
+    # and gives up on the integration. Surface the kind up front so the
+    # next round can act on it (retry vs ask the operator vs request
+    # different parameters).
+    failure_kind = result.get("failure_kind")
+    if failure_kind and failure_kind not in {"tool_result_succeeded"}:
+        kind_label = {
+            "request_authority_denied": (
+                "blocked by server request authority -- the operator has not "
+                "authorised this tool for this turn"
+            ),
+            "turn_contract_denied": (
+                "outside this turn's declared capabilities -- the turn contract "
+                "did not include this tool"
+            ),
+            "tool_policy_denied": (
+                "blocked by the active tool policy -- an admin or the "
+                "operator has disabled this tool. Do not retry; ask the "
+                "operator to enable it if needed."
+            ),
+            "exact_target_missing": (
+                "no exact target to seal -- the tool needs a real document "
+                "id/version before an approval can be sealed"
+            ),
+            "resource_identity_denied": (
+                "backend identity changed -- the tool is no longer bound to "
+                "the resource that authorised it"
+            ),
+        }.get(failure_kind, failure_kind)
+        parts.append(f"**failure_kind:** {kind_label}")
 
     if result.get("detached") or (
         result.get("status") == "running" and result.get("job_id")

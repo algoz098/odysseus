@@ -33811,6 +33811,12 @@ async def stream_agent_loop(
                     "exit_code": 1,
                     "blocked": True,
                     "policy": "current_tool_policy",
+                    # ``failure_kind`` lets ``format_tool_result`` and the
+                    # model see this is a configured denial, not a backend
+                    # error -- otherwise the model concludes "the server is
+                    # denying write operations" and gives up on a tool that
+                    # the operator explicitly disabled.
+                    "failure_kind": "tool_policy_denied",
                 }
                 logger.info(
                     "Tool blocked before approval by current policy: %s",
@@ -33841,6 +33847,7 @@ async def stream_agent_loop(
                         "exit_code": 1,
                         "blocked": True,
                         "policy": "exact_tool_approval_target",
+                        "failure_kind": "exact_target_missing",
                     }
                 else:
                     # The approval click becomes a synthetic user turn. Seal the
@@ -34604,6 +34611,15 @@ async def stream_agent_loop(
 
             # Emit tool_output (include ui_event data if present)
             tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code"), "execution_attempted": _execution_attempted, "blocked": bool(result.get("blocked", False))}
+            # ``failure_kind`` is the dispatcher-side reason a tool returned
+            # an error. Frontend surfaces use it to render different cards
+            # (approval card vs. error banner), and the model already gets
+            # it via ``format_tool_result``. Forwarding it here keeps the
+            # SSE event consistent with what the LLM sees, otherwise the UI
+            # and the model disagree on whether the same tool call was a
+            # denial or a backend failure.
+            if result.get("failure_kind"):
+                tool_output_data["failure_kind"] = result["failure_kind"]
             if _runtime_action is not None:
                 _runtime_action.normalize(block, 'agent_loop compatibility adapters')
                 _runtime_action.finish(result)
