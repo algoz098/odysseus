@@ -1204,7 +1204,9 @@ def _effective_agent_rounds(
             _looks_like_workspace_coding_request(str(message or ""))
             and re.search(
                 r"\b(?:edit|change|fix|repair|write|patch|modify|implement|add|remove|delete|rename|"
-                r"refactor|replace|update|create|apply|commit)\b",
+                r"refactor|replace|update|create|apply|commit|"
+                r"edite|consertar|reparar|reescrever|implementar|adicione|"
+                r"remova|apague|renomear|atualize|criar|aplicar|commitar)\b",
                 str(message or ""),
                 re.IGNORECASE,
             )

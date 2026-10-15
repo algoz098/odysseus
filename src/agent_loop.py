@@ -456,15 +456,15 @@ def _request_has_compound_actions(text: str) -> bool:
     ):
         return True
     groups = (
-        r"\b(?:create|add|make|write|draft|schedule|book|set\s+up)\b",
-        r"\b(?:list|search|find|locate|look\s+up)\b",
-        r"\b(?:read|open|inspect|view|download)\b",
-        r"\b(?:edit|update|change|replace|rewrite|append)\b",
-        r"\b(?:suggest|recommend|propose)\b",
-        r"\b(?:pause|disable|suspend)\b",
-        r"\b(?:resume|re-enable|bring\s+(?:it|them)\s+back)\b",
-        r"\b(?:delete|remove|cancel|get\s+rid\s+of)\b",
-        r"\b(?:verify|confirm|check)\b",
+        r"\b(?:create|add|make|write|draft|schedule|book|set\s+up|adicione|crie|criar|coloque|colocar|agende|agendar|marque|marcar)\b",
+        r"\b(?:list|search|find|locate|look\s+up|liste|liste|liste|procure|busque|pesquise|encontre)\b",
+        r"\b(?:read|open|inspect|view|download|leia|abra|verifique|veja)\b",
+        r"\b(?:edit|update|change|replace|rewrite|append|atualize|atualizar|edite|editar|reescreva|reescrever|encurte|encurtar|revise|revisar|substitua|substituir)\b",
+        r"\b(?:suggest|recommend|propose|sugira|sugerir|recomende|recomendar|proponha|propor)\b",
+        r"\b(?:pause|disable|suspend|pare|parar|desabilite|desabilitar|pausar)\b",
+        r"\b(?:resume|re-enable|bring\s+(?:it|them)\s+back|continue|retomar|retome|reinicie|reabilite|habilite|continue)\b",
+        r"\b(?:delete|remove|cancel|get\s+rid\s+of|apague|apagar|remova|remover|cancele|cancelar|delete|exclua|excluir)\b",
+        r"\b(?:verify|confirm|check|verifique|verificar|confirme|confirmar|checar|checar)\b",
     )
     return sum(bool(re.search(pattern, value, re.IGNORECASE)) for pattern in groups) >= 2
 
@@ -1113,8 +1113,8 @@ def _qwen38_router_tool_names(query: str) -> Set[str]:
     ):
         return {"manage_tasks"}
     if (
-        re.search(r"\b(?:delete|remove|cancel|get\s+rid\s+of|move|shift|reschedule|change)\b", q)
-        and re.search(r"\b(?:calendar|events?|meeting|appointment|pickup|reservation|festival)\b", q)
+        re.search(r"\b(?:delete|remove|cancel|get\s+rid\s+of|move|shift|reschedule|change|apague|apagar|remova|remover|cancele|cancelar|delete|mova|mover|remarque|remarcar|alterar|altera)\b", q)
+        and re.search(r"\b(?:calendar|events?|meeting|appointment|pickup|reservation|festival|calend[aá]rio|evento|reuni[aã]o|compromisso|consulta)\b", q)
     ):
         selected.add("manage_calendar")
     if re.search(r"(?:^|\s)(?:/tmp/|/home/|~/|\.{1,2}/)[^\s]+", q):
@@ -1236,8 +1236,8 @@ def _parse_explicit_skill_request(text: str) -> Optional[dict[str, Any]]:
     )
     if not name_match:
         name_match = re.search(
-            r"\b(?:delete|remove|trash|open|view|inspect|read)\s+(?:the\s+)?"
-            r"([a-z0-9][a-z0-9_.-]{2,100})\s+skill\b",
+            r"\b(?:delete|remove|trash|open|view|inspect|read|apague|apagar|remova|remover|exclua|excluir|abra|abrir|leia|ler|veja|ver|inspecione|inspecionar)\s+(?:a\s+|o\s+)?"
+            r"([a-z0-9][a-z0-9_.-]{2,100})\s+(?:skill|habilidade)\b",
             value,
             re.IGNORECASE,
         )
@@ -1259,20 +1259,20 @@ def _parse_explicit_skill_request(text: str) -> Optional[dict[str, Any]]:
         "from", "for", "with", "search", "result", "results", "list",
     }:
         return None
-    if re.search(r"\b(?:delete|remove|trash)\b", value, re.IGNORECASE):
+    if re.search(r"\b(?:delete|remove|trash|apague|apagar|remova|remover|exclua|excluir|delete)\b", value, re.IGNORECASE):
         action = "delete"
-    elif re.search(r"\b(?:publish|release)\b", value, re.IGNORECASE):
+    elif re.search(r"\b(?:publish|release|publique|publicar|publique|liberar)\b", value, re.IGNORECASE):
         action = "publish"
-    elif re.search(r"\b(?:view|open|inspect|read)\b", value, re.IGNORECASE):
+    elif re.search(r"\b(?:view|open|inspect|read|leia|abra|inspecione|veja)\b", value, re.IGNORECASE):
         action = "view"
     elif re.search(
-        r"^\s*(?:please\s+)?(?:add|create|make|write|save)\b",
+        r"^\s*(?:please\s+)?(?:add|create|make|write|save|adicione|crie|coloque|agende|marque|anote|salve|registre|atualize)\b",
         value,
         re.IGNORECASE,
     ):
         action = "add"
     elif re.search(
-        r"\b(?:verify|check|confirm|search|find|list|show)\b|\b(?:exists?|absent|missing)\b",
+        r"\b(?:verify|check|confirm|search|find|list|show|verifique|confirme|checar|liste|mostre|procure|busque|pesquise)\b|\b(?:exists?|absent|missing)\b",
         value,
         re.IGNORECASE,
     ):
@@ -1861,11 +1861,11 @@ def _calendar_expected_mutation_actions(user_text: str) -> set[str]:
     value = str(user_text or "").strip().lower()
     if not value:
         return set()
-    if re.search(r"\b(?:add|create|schedule|book|set\s+up)\b", value):
+    if re.search(r"\b(?:add|create|schedule|book|set\s+up|adicione|adicionar|crie|criar|coloque|colocar|agende|agendar|marque|marcar|remarque|remarcar)\b", value):
         return {"create", "create_event", "add", "add_event"}
-    if re.search(r"\b(?:move|shift|reschedule|change|update|rename|tag|retag|edit)\b", value):
+    if re.search(r"\b(?:move|shift|reschedule|change|update|rename|tag|retag|edit|mova|mover|mude|mudar|atualize|atualizar|edite|editar|reescreva|reescrever|altera|alterar)\b", value):
         return {"update", "update_event", "move", "reschedule", "edit_event"}
-    if re.search(r"\b(?:delete|cancel|remove|clear)\b", value):
+    if re.search(r"\b(?:delete|cancel|remove|clear|apague|apagar|remova|remover|cancele|cancelar|exclua|excluir|delete)\b", value):
         return {"delete", "delete_event", "remove", "remove_event", "cancel"}
     return set()
 
@@ -33986,6 +33986,99 @@ async def stream_agent_loop(
                             await _tool_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
+            # ``execute_tool_block`` flags a server request-authority denial
+            # with ``requires_authority_approval=True`` so the dispatch loop
+            # can replace the silent BLOCKED return with the same approval
+            # card the untrusted-context gate already uses. Without this, a
+            # tool the request authority drops is never presented to the user
+            # for a decision — the model just sees a blocked result and
+            # abandons the call ("the second attempt of any tool silently
+            # fails"). Convert it here so the operator gets a chance to
+            # grant the action, exactly like the untrusted-context path.
+            if (
+                isinstance(result, dict)
+                and result.get("requires_authority_approval")
+                and not exact_approval
+            ):
+                approval_document = (
+                    active_document
+                    if block.tool_type
+                    in {"edit_document", "suggest_document", "update_document"}
+                    else None
+                )
+                if (
+                    block.tool_type
+                    in {"edit_document", "suggest_document", "update_document"}
+                    and (
+                        approval_document is None
+                        or getattr(approval_document, "id", None) is None
+                        or getattr(approval_document, "version_count", None) is None
+                    )
+                ):
+                    # Same sealed-target guard as the security-gate path:
+                    # without a real document id/version the approval cannot
+                    # seal an exact action, so keep the BLOCKED result.
+                    pass
+                else:
+                    _authority_approval_selected_tools = set(
+                        _relevant_tools or ()
+                    )
+                    _authority_approval_selected_tools.update(
+                        name for name in _tool_names_sent if name
+                    )
+                    _authority_approval_selected_tools.add(block.tool_type)
+                    _authority_approval_selected_tools.difference_update(
+                        disabled_tools
+                    )
+                    _authority_pending = tool_approval_store.create(
+                        owner=owner,
+                        session_id=session_id,
+                        origin_run_id=run_security.run_id,
+                        tool_name=block.tool_type,
+                        content=block.content,
+                        workspace=workspace,
+                        document_id=getattr(approval_document, "id", None),
+                        document_version=getattr(
+                            approval_document, "version_count", None
+                        ),
+                        document_digest=(
+                            document_content_digest(
+                                getattr(
+                                    approval_document, "current_content", ""
+                                )
+                            )
+                            if approval_document is not None
+                            else None
+                        ),
+                        external_untrusted_context_seen=(
+                            run_security.external_untrusted_context_seen
+                        ),
+                        selected_tools=_authority_approval_selected_tools,
+                        continuation_query=_retrieval_query or _last_user,
+                        capabilities=capabilities_for_action(
+                            block.tool_type, block.content
+                        ),
+                        request_text=_last_user,
+                        request_authority=active_request_authority(),
+                        client_runtime_context=client_runtime_context,
+                    )
+                    desc = f"{block.tool_type}: APPROVAL REQUIRED"
+                    result = {
+                        "output": "Waiting for an exact user approval.",
+                        "exit_code": None,
+                        "approval_required": True,
+                        "ask_user": _authority_pending.public_payload(
+                            reason=result.get("authority_reason")
+                            or result.get("error")
+                            or "This action needs your explicit approval.",
+                        ),
+                    }
+                    logger.info(
+                        "Exact approval required after request-authority "
+                        "denial: %s",
+                        block.tool_type,
+                    )
 
             if _auto_local_media_evidence:
                 _local_media_evidence_required_block = True

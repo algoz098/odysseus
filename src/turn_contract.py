@@ -221,12 +221,81 @@ _REQUEST_PREFIX = (
     r"(?:(?:please|ok(?:ay)?|cool|nice|great|cheers|also|then|now|yes|yeah|sure|actually|only|go\s+ahead)[\s,!—–:-]+)*"
     r"(?:(?:can|could|would|will)\s+you\s+)?"
     r"(?:(?:i\s+(?:want|need)\s+you\s+to|i(?:['’]d|\s+would)\s+like\s+you\s+to)\s+)?"
+    # Portuguese helper-verb wrappers. The bare-verb pattern below already
+    # catches the imperative (coloque, agende, marque, ...); a sentence that
+    # leads with an auxiliary (Quero, Preciso, Vou, ...) and an infinitive
+    # has to reach the action verb as a token too, otherwise the family
+    # scan below it never sees an action signal and the request falls
+    # through to "no tool-action pattern matched". Keep this list narrow:
+    # only the wrappers the user actually writes in front of a request.
+    # Each auxiliary is optional individually; the whole group is optional
+    # so a bare imperative ("Coloque ...") still matches when nothing
+    # precedes it.
+    r"(?:"
+    r"(?:(?:eu|voc[êe]|voce|tu|n[óo]s|a\s+gente|ns|voc\u00ea)\s+)?"
+    r"(?:preciso|precisamos|precisaria|precisar[íi]amos|"
+    r"quero|queremos|quer[íi]a|quer[íi]amos|quis[eoa]mos|"
+    r"gostaria|gostar[íi]amos|gosto|"
+    r"vou|vamos|vamos\s+a|"
+    r"pretendo|pretendemos|"
+    r"iria|ir[íi]amos|"
+    r"desejo|desejamos|"
+    r"consigo|conseguimos|consegue|"
+    r"posso|podemos|pode|podem|podia|podemos|poder|poder[íi]a|poderia|poder[íi]amos|"
+    r"tenta|tente|tentamos|"
+    r"tentei|tentaram"
+    r")\s+(?:de\s+)?"
+    r"(?:poder|pode|conseguir|conseguiria|fazer|iria|ir[áa])?\s*"
+    r")?"
 )
 _ACTION_REQUEST = _REQUEST_PREFIX + (
+    # English action verbs (original list).
     r"(?:add|create|make|write|draft|edit|rewrite|shorten|revise|change|update|"
     r"replace|append|polish|fix|review|proofread|suggest|delete|remove|cancel|list|show|check|find|search|navigate|read|open|save|publish|set|put|schedule|"
     r"reschedule|move|block\s+off|reserve|send|reply|remember|forget|run|rerun|repeat|do|use|download|"
-    r"serve|stop|enable|disable|switch|research|investigate|generate|upscale|transcribe|inspect|browse)\b"
+    r"serve|stop|enable|disable|switch|research|investigate|generate|upscale|transcribe|inspect|browse"
+    # Portuguese imperative + 3rd-person singular present forms. The slot is
+    # the first verb in the sentence, exactly like the English verbs above:
+    # "Coloque na agenda", "Adicione um evento", "Agende uma reuniao", ...
+    # Without these, a Portuguese request that names a product family still
+    # gets ``needs_tools=False`` and the model can never call the tool the
+    # user asked for ("Coloque na agenda amanha as 10" stays outside the
+    # turn contract). Forms added are the common inflected surface forms of
+    # the verbs that already have an English entry: present indicative /
+    # imperative of the 1st/3rd person singular.
+    r"|coloque|coloca|colocar|adiciona|adicione|adicionar|crie|cria|criar|criando|"
+    r"agende|agenda|agendar|agendando|marque|marca|marcar|marcando|remarque|remarcar|"
+    r"apague|apaga|apagar|apagando|remova|remove|remover|removendo|"
+    r"cancele|cancela|cancelar|cancelando|liste|lista|listar|listando|"
+    r"mostre|mostra|mostrar|mostrando|verifique|verifica|verificar|verificando|"
+    r"procure|procura|procurar|procurando|busque|busca|buscar|buscando|"
+    r"pesquise|pesquisa|pesquisar|pesquisando|encontre|encontra|encontrar|encontrando|"
+    r"leia|l[eê]|ler|lendo|abra|abre|abrir|abrindo|salve|salva|salvar|salvando|"
+    r"atualize|atualiza|atualizar|atualizando|mude|muda|mudar|mudando|"
+    r"edite|edita|editar|editando|reescreva|reescreve|reescrever|reescrevendo|"
+    r"encurte|encurta|encurtar|encurtando|revise|revisa|revisar|revisando|"
+    r"substitua|substitui|substituir|substituindo|acrescente|acrescenta|acrescentar|"
+    r"conserte|conserta|consertar|consertando|repare|repara|reparar|reparando|"
+    r"sugira|sugere|sugerir|sugerindo|envie|envia|enviar|enviando|"
+    r"mande|manda|mandar|mandando|responda|responde|responder|respondendo|"
+    r"lembre|lembra|lembrar|lembrando|esque[çc]a|esquece|esquecer|esquecendo|"
+    r"execute|executa|executar|executando|repete|repetir|repetindo|"
+    r"corra|corre|correr|correndo|baixe|baixa|baixar|baixando|"
+    r"pare|para|parar|parando|habilite|habilita|habilitar|habilitando|"
+    r"desabilite|desabilita|desabilitar|desabilitando|"
+    r"troque|troca|trocar|trocando|investigue|investiga|investigar|investigando|"
+    r"gere|gera|gerar|gerando|transcreva|transcreve|transcrever|transcrevendo|"
+    r"inspecione|inspeciona|inspecionar|inspecionando|navegue|navega|navegar|navegando|"
+    r"reserve|reserva|reservar|reservando|mova|move|mover|movendo|"
+    r"publique|publica|publicar|publicando|fa[çc]a|faz|fazer|fazendo|"
+    r"use|usa|usar|usando|programe|programa|programar|programando|"
+    r"reprograme|reprograma|reprogramar|reprogramando|defina|define|definir|definindo|"
+    r"ponha|p[õo]e|p[ôo]r|postando|poste|posta|postar|"
+    r"anote|anota|anotar|anotando|registre|registra|registrar|registrando|"
+    r"insira|insere|inserir|inserindo|lan[çc]a|lance|lan[çc]ar|lan[çc]ando|"
+    # Colloquial/short forms ("bota" for "coloca" is very common in BR-PT).
+    r"bota|bote|botar|botei"
+    r")\b"
 )
 _ACTION = re.compile(r"^\s*" + _ACTION_REQUEST, re.I)
 _CONVERSATIONAL_ACTION_LEAD = re.compile(
@@ -351,9 +420,14 @@ _ORDINAL_SKILL_FOLLOWUP = re.compile(
     re.I,
 )
 _PURE_ACTION_PROHIBITION = re.compile(
-    r"^\s*(?:read[- ]only(?:\s+and)?\s+)?(?:do\s+not|don['’]?t|never)\s+"
+    r"^\s*(?:read[- ]only(?:\s+and)?\s+)?(?:do\s+not|don['’]?t|never|n[ãa]o|jamais)\s+"
     r"(?:add|create|make|write|draft|edit|change|update|delete|remove|send|reply|"
-    r"run|execute|download|serve|open|save|schedule|transcribe|inspect)\b"
+    r"run|execute|download|serve|open|save|schedule|transcribe|inspect|"
+    r"adicione|crie|coloque|agende|marque|apague|remova|cancele|liste|mostre|"
+    r"verifique|procure|busque|pesquise|encontre|atualize|"
+    r"criar|adicionar|apagar|cancelar|remover|atualizar|"
+    r"fazer|executar|salvar|enviar|mandar|listar|buscar|pesquisar|procurar|"
+    r"abrir|ler|ver|checar|checar)\b"
     r"[^.;\n]*[.!?]*\s*$",
     re.I,
 )
@@ -362,9 +436,14 @@ _PURE_ACTION_PROHIBITION = re.compile(
 def _is_pure_action_prohibition(text: str) -> bool:
     value = str(text or "").strip()
     prefix = re.match(
-        r"(?:read[- ]only(?:\s+and)?\s+)?(?:do\s+not|don['’]?t|never)\s+"
+        r"(?:read[- ]only(?:\s+and)?\s+)?(?:do\s+not|don['’]?t|never|n[ãa]o|jamais)\s+"
         r"(?:add|create|make|write|draft|edit|change|update|delete|remove|send|reply|"
-        r"run|execute|download|serve|open|save|schedule|transcribe|inspect)\b",
+        r"run|execute|download|serve|open|save|schedule|transcribe|inspect|"
+        r"adicione|crie|coloque|agende|marque|apague|remova|cancele|liste|mostre|"
+        r"verifique|procure|busque|pesquise|encontre|atualize|"
+        r"criar|adicionar|apagar|cancelar|remover|atualizar|"
+        r"fazer|executar|salvar|enviar|mandar|listar|buscar|pesquisar|procurar|"
+        r"abrir|ler|ver|checar|checar)\b",
         value,
         re.I,
     )
@@ -413,11 +492,17 @@ _CONTEXTUAL_UI_VIEW_CHANGE = re.compile(
     re.I,
 )
 _CONTEXTUAL_ACTION = re.compile(
-    r"^\s*(?:in|on|for)\s+(?:this|that|the)\s+"
-    r"(?:document|doc|note|task|event|calendar|memory|skill|email)\b"
+    r"^\s*(?:in|on|for)\s+(?:this|that|the|esse|essa|este|esta|aquele|aquela)\s+"
+    r"(?:document|doc|note|task|event|calendar|memory|skill|email|"
+    r"documento|nota|tarefa|evento|calend[aá]rio|mem[óo]ria|habilidade|email)\b"
     r"[^.;\n]{0,80}?\b(?:add|create|write|draft|edit|rewrite|shorten|revise|change|"
     r"update|replace|append|polish|fix|delete|remove|cancel|save|schedule|"
-    r"reschedule|move|send|reply|remember|forget)\b",
+    r"reschedule|move|send|reply|remember|forget|"
+    r"adicione|crie|coloque|agende|marque|apague|remova|cancele|liste|mostre|"
+    r"verifique|procure|busque|pesquise|encontre|atualize|"
+    r"criar|adicionar|apagar|cancelar|remover|atualizar|"
+    r"fazer|executar|salvar|enviar|mandar|listar|buscar|pesquisar|procurar|"
+    r"abrir|ler|ver)\b",
     re.I,
 )
 _CONDITIONAL_ACTION = re.compile(
@@ -859,6 +944,12 @@ _ACTION_VERBS = frozenset({
     "download", "serve", "stop", "enable", "disable", "switch", "put", "research", "rerun",
     "investigate", "generate", "upscale", "transcribe", "inspect", "browse",
     "review", "proofread", "suggest", "stick",
+    # The Portuguese inflected forms are matched exactly by the
+    # ``_ACTION_REQUEST`` regex above. They are intentionally *not* added to
+    # the typo-distance list here: a 4-letter Portuguese verb (gere, manda,
+    # ...) is one transposition away from common English words (here, many,
+    # ...) and would promote ordinary prose to action intent. The inflected
+    # forms already in the regex cover the common user phrasings.
 })
 
 
@@ -1041,16 +1132,23 @@ def creation_container_tool(message: str) -> str | None:
         return 'manage_tasks'
     match = re.match(
         r'^\s*' + _REQUEST_PREFIX
-        + r'(?:add|create|write|save|make|set\s+up)\s+'
+        + r'(?:add|create|write|save|make|set\s+up|'
+        r'adicione|adicione|adicione|crie|criar|coloque|colocar|agende|agendar|marque|marcar|anote|anotar|registre|registrar|remarque|remarcar|'
+        r'apague|apagar|remova|remover|cancele|cancelar|liste|listar|mostre|mostrar|'
+        r'atualize|atualizar|edite|editar|reescreva|reescrever|programe|programar|'
+        r'salve|salvar|envie|enviar|mande|mandar|execute|executar|leia|ler|abra|abrir|'
+        r'procure|procurar|busque|buscar|pesquise|pesquisar|encontre|encontrar|'
+        r'verifique|verificar|use|usar|fa[çc]a|fazer)\s+'
         r'(?:(?:a|an|the|my|new|quick|short|freeform|temporary|scheduled|recurring|'
-        r'single|one|two|three|four|five|six|seven|eight|nine|ten|[1-9]\d*)\s+)*'
-        r'(?P<container>to[ -]?dos?|checklists?|tasks?|automations?|scheduled\s+jobs?)\b',
+        r'single|one|two|three|four|five|six|seven|eight|nine|ten|[1-9]\d*|'
+        r'um|uma|uns|umas|novo|nova|meu|minha|seu|sua)\s+)*'
+        r'(?P<container>to[ -]?dos?|checklists?|tasks?|automations?|scheduled\s+jobs?|tarefas?|notas?|lembretes?)\b',
         text, re.I,
     )
     if not match:
         return None
     container = match['container'].lower()
-    return 'manage_tasks' if re.match(r'(?:task|automation|scheduled)', container) else 'manage_notes'
+    return 'manage_tasks' if re.match(r'(?:task|automation|scheduled|taref|pend[eê]ncia)', container) else 'manage_notes'
 
 
 def standalone_code_request(message: str) -> bool:
@@ -1060,8 +1158,8 @@ def standalone_code_request(message: str) -> bool:
         return False
     if re.search(r'\b(?:using|with|via)\s+(?:bash|shell|python)\b', text, re.I):
         return False
-    if re.match(r'^' + _REQUEST_PREFIX + r'(?:write|create|make|build|generate|implement|code)\s+', text, re.I):
-        body = re.sub(r'^' + _REQUEST_PREFIX + r'(?:write|create|make|build|generate|implement|code)\s+', '', text, flags=re.I)
+    if re.match(r'^' + _REQUEST_PREFIX + r'(?:write|create|make|build|generate|implement|code|escreva|fa[çc]a|crie|criar|construa|construir|gere|gerar|implemente|implementar|programe|programar|desenvolva|desenvolver)\s+', text, re.I):
+        body = re.sub(r'^' + _REQUEST_PREFIX + r'(?:write|create|make|build|generate|implement|code|escreva|fa[çc]a|crie|criar|construa|construir|gere|gerar|implemente|implementar|programe|programar|desenvolva|desenvolver)\s+', '', text, flags=re.I)
         if re.match(r'(?:(?:a|an|the|new|short|brief|simple)\s+)*(?:email|reply|note|task|document|article|explanation|tutorial|example|snippet)\b', body, re.I):
             return False
         return bool(re.search(r'\b(?:code|script|program|game|app|website|webpage|html|svg)\b|\bin\s+(?:python|javascript|typescript|rust|go|java|c\+\+|ruby|php)\b', body, re.I))
@@ -4497,7 +4595,15 @@ def _clause_capabilities(text: str) -> set[str]:
     fuzzy = (fuzzy_near_action or _fuzzy_family(text)) if fuzzy_gate else None
     if fuzzy and not words:
         return {fuzzy}
-    if fuzzy and fuzzy == fuzzy_near_action and fuzzy not in words:
+    # A fuzzy match is a heuristic for a misspelled product noun ("nte" for
+    # "note"). When the user names the product explicitly -- even in
+    # another language ("agenda" in pt-BR maps to the calendar family) --
+    # the explicit match wins, not a coincidental typo. The first branch
+    # above only fires when the sentence has no explicit product noun;
+    # this one was promoting "Bote na agenda" to notes because the
+    # colloquial "bote" is one edit from "note", even though "agenda"
+    # already names the calendar family.
+    if fuzzy and fuzzy == fuzzy_near_action and fuzzy not in words and not words:
         return {fuzzy}
     if (fuzzy_near_action == "search_browser"
             and (first_token_family == "search_browser"

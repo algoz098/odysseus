@@ -32,10 +32,25 @@ _PLEASE = r"^\s*(?:(?:please|ok(?:ay)?|alright|right|sure|cool|great|thanks)[\s,
 _CALENDAR_ACTION = (
     r"(?:add|adding|create|creating|recreate|recreating|schedule|scheduling|"
     r"reschedule|rescheduling|book|booking|put|set\s+up|make|making|"
-    r"delete|deleting|remove|removing|cancel|cancelling|canceling)"
+    r"delete|deleting|remove|removing|cancel|cancelling|canceling"
+    # Portuguese inflected forms. The slot is a leading verb in a
+    # request that names a calendar product; without these, a request
+    # like ``Coloque na agenda amanha as 10`` is classified as no-action
+    # and the agent never gets to a calendar tool.
+    r"|adicione|adiciona|crie|cria|coloque|coloca|agende|agenda|marque|marca|"
+    r"remarque|remarca|apague|apaga|remova|remove|cancele|cancela|"
+    r"liste|lista|mostre|mostra|programe|programa|reprograme|reprograma|"
+    r"reagende|reagenda"
+    r")"
 )
-_CALENDAR_THING = r"(?:calendar|calendar\s+(?:entry|item)|event|meeting|appointment|entry|call)"
-_CALENDAR_READ_THING = r"(?:calendar|schedule|events?|meetings?|appointments?|classes?)"
+_CALENDAR_THING = (
+    r"(?:calendar|calendar\s+(?:entry|item)|event|meeting|appointment|entry|call|"
+    r"agenda|calend[aá]rio|evento|compromisso|reuni[aã]o|consulta)"
+)
+_CALENDAR_READ_THING = (
+    r"(?:calendar|schedule|events?|meetings?|appointments?|classes?|"
+    r"agenda|calend[aá]rio|evento|compromisso|reuni[aã]o|consulta)"
+)
 _EXPLANATORY_PREFIX = re.compile(
     r"^\s*(?:how\s+(?:do|can)\s+i|can\s+you\s+explain|what\s+about|tell\s+me\s+how|show\s+me\s+how)\b",
     re.I,
@@ -106,20 +121,22 @@ _ROUTING_PATTERNS: tuple[tuple[str, str, Pattern[str]], ...] = tuple(
 
         # Notes, todos, checklists, and reminders.
         ("notes", "reminder request", r"\bremind\s+me\b"),
-        ("notes", "assistant note/todo action request", rf"{_ACTION_QUESTION}(?:add|create|make|take|jot|write\s+down|set)\b.{{0,120}}\b(?:note|todo|task|checklist|reminder)\b"),
-        ("notes", "note/todo imperative request", rf"{_PLEASE}(?:add|create|make)\s+(?:a\s+|an\s+)?(?:todo|task|reminder|note|checklist)\b"),
-        ("notes", "take note request", rf"{_PLEASE}(?:take|jot|write\s+down)\s+(?:a\s+|an\s+)?note\b"),
-        ("notes", "add item to notes/todo request", rf"{_PLEASE}(?:add|jot|write\s+down)\b.{{0,120}}\b(?:to|in|into)\s+(?:my\s+|the\s+)?(?:todo(?:\s+list)?|task\s+list|notes?|checklist)\b"),
+        ("notes", "assistant note/todo action request", rf"{_ACTION_QUESTION}(?:add|create|make|take|jot|write\s+down|set|adicione|crie|anote|lembre|registre|anotar|lembrar|registrar)\b.{{0,120}}\b(?:notes?|todos?|checklists?|reminders?|notas?|lembretes?)(?:\s|$)"),
+        ("notes", "note/todo imperative request", rf"{_PLEASE}(?:add|create|make|adicione|crie|anote)\s+(?:a\s+|an\s+|uma?\s+)?(?:todos?|tasks?|reminders?|notes?|checklists?|notas?|lembretes?)(?:\s|$)"),
+        ("notes", "take note request", rf"{_PLEASE}(?:take|jot|write\s+down|anote)\s+(?:a\s+|an\s+|uma?\s+)?(?:nota|note)s?\b"),
+        ("notes", "add item to notes/todo request", rf"{_PLEASE}(?:add|jot|write\s+down|adicione|anote)\b.{{0,120}}\b(?:to|in|into|em|na|no)\s+(?:my\s+|the\s+|minhas?\s+|(?:minha|meu)\s+)?(?:todo(?:\s+list)?|task\s+list|notes?|checklists?|notas?|lembretes?)(?:\s|$)"),
+        ("tasks", "task creation request", rf"{_PLEASE}(?:add|create|make|adicione|crie|criar)\s+(?:a\s+|an\s+|uma?\s+)?(?:tasks?|tarefas?|pend[eê]ncias?)\b"),
+        ("tasks", "assistant task creation request", rf"{_ACTION_QUESTION}(?:add|create|make|adicione|crie|criar)\b.{{0,120}}\b(?:tasks?|tarefas?|pend[eê]ncias?)\b"),
         ("notes", "set reminder request", rf"{_PLEASE}set\s+(?:a\s+)?reminder\b"),
         ("notes", "assistant reminder request", rf"{_ACTION_QUESTION}set\s+(?:a\s+)?reminder\b"),
 
         # Email actions.
-        ("email", "assistant email action request", rf"{_ACTION_QUESTION}(?:send|write|reply|email|message|archive|delete|mark)\b.{{0,120}}\b(?:emails?|mail|messages?|inbox|unread|read)\b"),
-        ("email", "send/write/reply email request", rf"{_PLEASE}(?:send|write|reply)\b.{{0,120}}\b(?:emails?|mail|messages?)\b"),
-        ("email", "archive/delete/mark email request", rf"{_PLEASE}(?:archive|delete|mark)\b.{{0,120}}\b(?:emails?|mail|messages?|inbox)\b"),
-        ("email", "email composition request", r"\b(?:send|write|reply)\s+(?:an?\s+)?(?:email|message|mail)\b"),
+        ("email", "assistant email action request", rf"{_ACTION_QUESTION}(?:send|write|reply|email|message|archive|delete|mark|mande|envie|responda|apague|marque|arquive)\b.{{0,120}}\b(?:emails?|mail|messages?|inbox|unread|read|caixa(?:\s+de\s+entrada)?)\b"),
+        ("email", "send/write/reply email request", rf"{_PLEASE}(?:send|write|reply|mande|envie|responda)\b.{{0,120}}\b(?:emails?|mail|messages?|caixa(?:\s+de\s+entrada)?)\b"),
+        ("email", "archive/delete/mark email request", rf"{_PLEASE}(?:archive|delete|mark|apague|arquive|marque)\b.{{0,120}}\b(?:emails?|mail|messages?|inbox|caixa(?:\s+de\s+entrada)?)\b"),
+        ("email", "email composition request", r"\b(?:send|write|reply|mande|envie|responda)\s+(?:an?\s+|um\s+|uma\s+)?(?:email|message|mail|recado)\b"),
         ("email", "email contact request", r"\bemail\s+\w+\b"),
-        ("email", "check inbox request", r"\bcheck\s+(?:my\s+)?(?:email|inbox|mail)\b"),
+        ("email", "check inbox request", r"\bcheck\s+(?:my\s+)?(?:email|inbox|mail|caixa(?:\s+de\s+entrada)?)\b"),
         ("email", "unread email request", r"\bunread\s+(?:email|mail)s?\b"),
 
         # UI/control-plane actions that should open panels or flip toggles.
